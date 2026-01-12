@@ -1,0 +1,19 @@
+name: stock_prediction_20251211
+prefix: /data/project_20251211/.conda_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pandas>=2.0.0
+  - numpy>=1.24.0
+  - scikit-learn
+  - matplotlib
+  - jupyter
+  - ipykernel
+  - pip:
+    - torch
+    - torchvision
+    - torchaudio
+

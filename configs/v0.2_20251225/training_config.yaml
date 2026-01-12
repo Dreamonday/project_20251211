@@ -1,0 +1,76 @@
+# 训练配置文件（集成TensorBoard）
+# 版本: v0.2
+# 日期: 20251225
+
+metadata:
+  version: "v0.2"
+  date: "20251225"
+  description: "训练配置 (集成TensorBoard可视化) - TSMixer模型"
+
+training:
+  # 基础训练参数
+  batch_size: 96
+  num_epochs: 25
+  num_workers: 0          # 从8改为4，减少锁竞争
+  pin_memory: true
+  prefetch_factor: 2      # 预取批次数，提升数据加载速度
+  persistent_workers: true # 保持worker进程，避免每个epoch重启
+  
+  # 优化器配置
+  optimizer:
+    type: "adamw"  # "adam", "adamw", "sgd"
+    lr: 1e-4       # 初始学习率
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  
+  # 学习率调度器
+  scheduler:
+    type: "cosine"  # "cosine", "step", "plateau", "none"
+    T_max: 25       # Cosine退火的最大周期数
+    eta_min: 1e-5  # 最小学习率
+    step_size: 30   # StepLR的步长
+    gamma: 0.1      # StepLR的衰减率
+    factor: 0.5     # ReduceLROnPlateau的衰减因子
+    patience: 10    # ReduceLROnPlateau的耐心值
+  
+  # 损失函数
+  loss:
+    type: "mape"  # "mse", "mae", "huber", "mape"
+    reduction: "mean"
+    # MAPE特有参数（仅当type="mape"时有效）
+    epsilon: 1e-8  # 防止除零的小值
+  
+  # 验证和保存
+  val_interval: 1        # 每N个epoch验证一次
+  save_interval: 999999  # 每N个epoch保存一次模型（设置为很大值以禁用定期保存，只保存最佳模型）
+  save_best: true        # 是否保存最佳模型
+  early_stopping:
+    enabled: true
+    patience: 20         # 早停耐心值
+    min_delta: 0.0001    # 最小改进阈值
+  
+  # 设备配置
+  device: "cuda"  # "cuda" 或 "cpu"
+  mixed_precision: false  # 是否使用混合精度训练
+
+# TensorBoard配置
+tensorboard:
+  enabled: true                  # 是否启用TensorBoard
+  log_dir: "tensorboard"         # TensorBoard日志目录（相对于实验目录）
+  log_interval: 50               # 每N个batch记录一次标量（loss等）
+  histogram_interval: 500        # 每N个batch记录一次参数/梯度直方图
+  log_histograms: true           # 是否记录参数和梯度的直方图
+  
+  # 记录内容说明：
+  # - Loss/train_batch: 每个batch的训练损失
+  # - Loss/train_epoch: 每个epoch的训练损失（样本级平均）
+  # - Loss/val_epoch: 验证损失
+  # - Metrics/train_*: 训练集指标（mae, mse, rmse, mape, r2）
+  # - Metrics/val_*: 验证集指标
+  # - Learning_Rate: 学习率变化
+  # - Parameters/*: 模型参数分布（直方图）
+  # - Gradients/*: 梯度分布（直方图）
+  # - Predictions/scatter_plot: 预测值vs真实值散点图（每5个epoch）
+
+
+

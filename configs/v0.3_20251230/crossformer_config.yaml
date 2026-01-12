@@ -1,0 +1,68 @@
+# Crossformer 模型配置文件
+# 版本: v0.3
+# 日期: 20251230
+
+metadata:
+  version: "v0.3"
+  date: "20251230"
+  description: "Crossformer模型配置 - Two-Stage Attention + 跨维度交互"
+
+model:
+  name: "crossformer"
+  
+  # 输入输出维度（会自动根据实际数据调整，这里的值只是初始值）
+  seq_len: 500          # 输入序列长度（会自动检测并更新）
+  n_features: 64        # 特征数量（会自动检测并更新，无需手动修改）
+  prediction_len: 1     # 预测长度（输出维度）
+  
+  # 基础架构参数
+  d_model: 512          # 隐藏维度
+  n_blocks: 4           # Crossformer块数量
+  n_heads: 8            # 注意力头数
+  dropout: 0.1          # Dropout比率
+  activation: "gelu"    # 激活函数: "gelu" 或 "relu"
+  
+  # Crossformer特有参数
+  n_segments: 50        # 时间分段数（seq_len=500时，每段10步）
+  n_feature_groups: 8   # 特征分组数（n_features必须能整除）
+  router_topk_ratio: 0.8  # Router保留的segment/group比例（保留80%）
+  
+  # 位置编码配置
+  use_input_rope: true  # 是否在输入投影后使用RoPE位置编码（默认true）
+  rope_max_seq_len: 1000  # RoPE最大序列长度
+  n_rope_heads: 8  # 输入级RoPE的头数（默认8，与n_heads一致，d_model必须能被n_rope_heads整除）
+  rope_alpha: 0.1  # RoPE位置编码的缩放因子（可学习参数，初始值0.1）
+  
+  # 位置编码
+  positional_encoding:
+    type: "learnable"   # "learnable" 或 "sinusoidal"
+    segment_encoding: true  # 是否使用分段位置编码
+  
+  # 聚合策略
+  temporal_aggregation:
+    type: "hierarchical"  # "hierarchical" 或 "mean"
+    use_attention: true
+  
+  # 输出投影（与TSMixer相同）
+  output_projection:
+    dims: [64, 32]  # d_model -> 64 -> 32 -> prediction_len
+
+# 架构说明：
+# - 输入投影：n_features -> d_model
+# - 输入级RoPE位置编码（多头融合方案）：
+#   - 将输入分成n_rope_heads个头（默认8个头，每个头d_k=64维）
+#   - 对每个头独立应用RoPE位置编码（位置：0到seq_len-1）
+#   - 融合多头结果，通过残差连接添加到输入（缩放因子rope_alpha=0.1，可学习）
+#   - 优势：捕获不同频率的位置模式，保留RoPE的相对位置编码特性
+# - CrossformerBlock × n_blocks (默认4层)
+# - 每个Block包含：
+#   1. Two-Stage时间注意力：
+#      - Stage-1: Router找出重要的时间段（50段中选40段，如果topk_ratio=0.8）
+#      - Stage-2: 对重要时间段做cross-segment attention（使用segment索引的位置编码）
+#   2. Two-Stage特征注意力：
+#      - Stage-1: Router找出重要的特征组（8组中选6组，如果topk_ratio=0.8）
+#      - Stage-2: 对重要特征组做cross-group attention（使用group索引的位置编码）
+# - 使用Pre-LayerNorm和残差连接（与Transformer标准架构一致）
+# - 层次化聚合：多尺度segment表示 + attention加权融合
+# - 输出投影：多层残差降维（512 -> 64 -> 32 -> 1）
+

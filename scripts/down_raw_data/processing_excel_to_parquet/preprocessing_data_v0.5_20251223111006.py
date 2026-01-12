@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+财务数据预处理脚本 v0.5_20251223111006
+
+功能：
+1. 从1400+个Excel文件中提取"财报_日K对齐"sheet的数据
+2. 提取公司标识信息（从文件名和第一行数据）
+3. 删除不需要的列（股票代码、财报数据截止日期、匹配财报公告日期）
+4. 使用每家公司的数据单独导出Parquet，文件名与原Excel保持一致
+5. 将货币单位统一映射为数值，方便训练
+6. 填充数值列的缺失值为0（排除标识列）
+7. 生成元数据、公司映射和处理日志
+8. 【v0.4新增】根据股票市场类型（A股/港股/美股）添加对应的指数数据
+9. 【v0.4新增】确保股票代码和货币单位列填充所有行
+10. 【v0.5新增】保持Excel原始列顺序，公司标识列和指数列放在最前面
+
+输出：
+- {原Excel文件名}.parquet: 每家公司的预处理数据（包含指数数据）
+- data_metadata_v0.5.json: 元数据信息
+- company_mapping_v0.5.json: 公司映射表
+- processing_log_v0.5.txt: 处理日志
+"""
+
+import re
+import json
+import pandas as pd
+from datetime import datetime
+from pathlib import Path
+
+# =========================== 配置区域 ===========================
+# Excel文件所在目录
+EXCEL_DIR = "01上市公司财务数据与日K融合-陈俊同-20251220"
+
+# 输出目录
+OUTPUT_DIR = "preprocessing_data_20251209/processed_data_20251220"
+
+# 指数数据文件路径
+INDEX_FILE_PATH = "macro_index_v0.1_20251220_220156.xlsx"
+
+# 版本信息
+VERSION_SUFFIX = "v0.5"
+METADATA_VERSION = "v0.5_20251223111006"
+
+# 需要删除的列
+COLS_TO_DROP = [
+    "股票代码",
+    "财报数据截止日期",
+    "匹配财报公告日期"
+]
+
+# 需要从第一行提取作为公司标识的列（提取后也会删除）
+COLS_TO_EXTRACT = [
+    "股票代码",
+    "货币单位"
+]
+
+# 公司标识列（放在最前面）
+COMPANY_IDENTITY_COLS = [
+    'sequence_id',
+    'company_name',
+    'stock_code',
+    '货币单位'
+]
+
+# 市场类型与指数映射
+MARKET_INDEX_MAPPING = {
+    'A股': ['沪深300', '中证500'],
+    '港股': ['恒生指数', '恒生科技'],
+    '美股': ['标普500', '纳斯达克']
+}
+
+# 批次处理大小（每次处理N个文件后合并，避免内存溢出）
+BATCH_SIZE = 50
+
+# =================================================================
+
+
+def determine_market(stock_code):
+    """
+    根据股票代码判断市场类型
+    支持市场后缀识别（.HK, .SZ, .SH, .N等）和全英文代码判断
+    
+    Args:
+        stock_code: 股票代码字符串（可能包含市场后缀，如00003.HK、300760.SZ、TSM等）
+    
+    Returns:
+        str: 'A股', '港股', '美股', 或 'Unknown'
+    """
+    if not stock_code or pd.isna(stock_code):
+        return 'Unknown'
+    
+    code_str = str(stock_code).strip().upper()
+    
+    # 优先根据市场后缀判断
+    if code_str.endswith('.HK'):
+        return '港股'
+    elif code_str.endswith(('.SZ', '.SH')):
+        return 'A股'
+    elif code_str.endswith(('.N', '.O', '.A', '.B', '.C')):
+        # .N for NYSE, .O for NASDAQ, etc.
+        return '美股'
+    
+    # 如果没有后缀，根据代码格式判断
+    # A股判断：6开头（上交所），0/3开头（深交所），且全部是数字
+    if code_str.startswith(('6', '0', '3')) and code_str.isdigit():
+        return 'A股'
+    
+    # 港股判断：5位数字
+    if len(code_str) == 5 and code_str.isdigit():
+        return '港股'
+    
+    # 美股判断：全英文（且不是A股/港股的格式）
+    if code_str.isalpha():
+        return '美股'
+    
+    # 如果包含字母但不是全英文，可能是美股（如BRK.B）
+    if any(c.isalpha() for c in code_str):
+        return '美股'
+    
+    return 'Unknown'
+
+
+def load_all_index_data(index_file_path):
+    """
+    预加载所有指数数据
+    
+    Args:
+        index_file_path: 指数Excel文件路径
+    
+    Returns:
+        dict: {指数名称: DataFrame}，DataFrame以日期为索引
+    """
+    print("\n" + "="*80)
+    print("预加载指数数据")
+    print("="*80)
+    
+    if not Path(index_file_path).exists():
+        print(f"  ⚠️ 警告: 指数文件不存在: {index_file_path}")
+        print("  将跳过指数数据合并")
+        return {}
+    
+    index_data_dict = {}
+    
+    try:
+        # 读取所有需要的指数sheet
+        all_indices = set()
+        for indices in MARKET_INDEX_MAPPING.values():
+            all_indices.update(indices)
+        
+        excel_file = pd.ExcelFile(index_file_path)
+        available_sheets = excel_file.sheet_names
+        
+        for index_name in all_indices:
+            if index_name not in available_sheets:
+                print(f"  ⚠️ 警告: 指数 {index_name} 的sheet不存在，跳过")
+                continue
+            
+            try:
+                # 读取指数数据
+                df = pd.read_excel(index_file_path, sheet_name=index_name)
+                
+                if df.empty:
+                    print(f"  ⚠️ 警告: 指数 {index_name} 数据为空，跳过")
+                    continue
+                
+                # 确保日期列存在且为datetime类型
+                if '日期' not in df.columns:
+                    print(f"  ⚠️ 警告: 指数 {index_name} 缺少日期列，跳过")
+                    continue
+                
+                df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
+                df = df.dropna(subset=['日期'])
+                
+                if df.empty:
+                    print(f"  ⚠️ 警告: 指数 {index_name} 删除无效日期后为空，跳过")
+                    continue
+                
+                # 重命名列，添加指数名称前缀（除了日期列）
+                rename_dict = {}
+                for col in df.columns:
+                    if col != '日期':
+                        rename_dict[col] = f"{index_name}_{col}"
+                df = df.rename(columns=rename_dict)
+                
+                # 去重并排序
+                df = df.drop_duplicates(subset=['日期'], keep='first')
+                df = df.sort_values('日期')
+                
+                index_data_dict[index_name] = df
+                print(f"  ✓ 已加载 {index_name}: {len(df)} 条记录 ({df['日期'].min()} ~ {df['日期'].max()})")
+                
+            except Exception as e:
+                print(f"  ✗ 加载指数 {index_name} 失败: {e}")
+                continue
+        
+        print(f"\n  共成功加载 {len(index_data_dict)} 个指数")
+        return index_data_dict
+        
+    except Exception as e:
+        print(f"  ✗ 加载指数文件失败: {e}")
+        return {}
+
+
+def merge_index_data(company_df, market_type, index_data_dict):
+    """
+    根据市场类型合并对应的指数数据
+    
+    Args:
+        company_df: 公司数据DataFrame
+        market_type: 市场类型 ('A股', '港股', '美股')
+        index_data_dict: 预加载的指数数据字典
+    
+    Returns:
+        DataFrame: 合并指数数据后的公司数据
+    """
+    if market_type not in MARKET_INDEX_MAPPING:
+        return company_df
+    
+    if '日期' not in company_df.columns:
+        return company_df
+    
+    # 获取该市场对应的指数列表
+    indices_to_merge = MARKET_INDEX_MAPPING[market_type]
+    
+    # 确保日期列为datetime类型
+    company_df['日期'] = pd.to_datetime(company_df['日期'], errors='coerce')
+    
+    merged_df = company_df.copy()
+    merged_count = 0
+    
+    for index_name in indices_to_merge:
+        if index_name not in index_data_dict:
+            continue
+        
+        index_df = index_data_dict[index_name].copy()
+        
+        # 左连接：保留公司的所有日期
+        merged_df = pd.merge(
+            merged_df,
+            index_df,
+            on='日期',
+            how='left'
+        )
+        merged_count += 1
+    
+    # 填充指数列的缺失值为0
+    # 识别新增的指数列（列名包含指数名称）
+    index_columns = []
+    for index_name in indices_to_merge:
+        if index_name in index_data_dict:
+            for col in merged_df.columns:
+                if col.startswith(f"{index_name}_"):
+                    index_columns.append(col)
+    
+    if index_columns:
+        merged_df[index_columns] = merged_df[index_columns].fillna(0)
+    
+    return merged_df
+
+
+def parse_filename(filename):
+    """
+    解析文件名，提取公司信息
+    格式: {序号}_{公司名}_{股票代码}_{时间戳}.xlsx
+    例如: 0001_中国铝业_601600_20251115_235412.xlsx
+    """
+    match = re.match(r'^(\d+)_(.+?)_(.+?)_(\d{8}_\d{6})\.xlsx$', filename)
+    if match:
+        sequence_id = int(match.group(1))
+        company_name = match.group(2)
+        stock_code = match.group(3)
+        timestamp = match.group(4)
+        return {
+            'sequence_id': sequence_id,
+            'company_name': company_name,
+            'stock_code': stock_code,
+            'timestamp': timestamp
+        }
+    return None
+
+
+def extract_company_info_from_data(df, filename_info):
+    """
+    从数据第一行提取公司信息
+    """
+    company_info = filename_info.copy()
+    
+    # 从第一行提取股票代码和货币单位
+    if len(df) > 0:
+        for col in COLS_TO_EXTRACT:
+            if col in df.columns:
+                value = df[col].iloc[0]
+                if pd.notna(value):
+                    # 统一key名称：股票代码 -> stock_code，货币单位 -> 货币单位
+                    if col == "股票代码":
+                        key = "stock_code"
+                    elif col == "货币单位":
+                        key = "货币单位"
+                    else:
+                        # 其他列：将列名转换为key（去掉空格，转为小写）
+                        key = col.replace(' ', '_').lower()
+                    company_info[key] = str(value)
+    
+    return company_info
+
+
+def process_single_file(file_path, filename_info, index_data_dict):
+    """
+    处理单个Excel文件（v0.5增强版：保持Excel原始列顺序）
+    
+    Args:
+        file_path: Excel文件路径
+        filename_info: 从文件名解析的公司信息
+        index_data_dict: 预加载的指数数据
+    
+    Returns:
+        tuple: (DataFrame, company_info, market_type, error_message)
+    """
+    try:
+        # 读取"财报_日K对齐"sheet
+        df = pd.read_excel(file_path, sheet_name='财报_日K对齐')
+        
+        if df.empty:
+            return None, None, None, "数据为空"
+        
+        # 提取公司信息（从第一行）
+        company_info = extract_company_info_from_data(df, filename_info)
+        
+        # 【v0.4修复】使用Excel第一行的股票代码（优先），如果不存在则使用文件名中的股票代码
+        # company_info['stock_code'] 的值：优先Excel第一行的"股票代码"列（可能包含后缀如.HK、.SZ、.SH、.N等），否则文件名中的股票代码
+        extracted_stock_code = company_info.get('stock_code', filename_info['stock_code'])
+        extracted_currency = company_info.get('货币单位')
+        
+        # 删除不需要的列（包括COLS_TO_EXTRACT中的列）
+        cols_to_drop_actual = []
+        for col in COLS_TO_DROP:
+            if col in df.columns:
+                cols_to_drop_actual.append(col)
+        for col in COLS_TO_EXTRACT:
+            if col in df.columns and col not in cols_to_drop_actual:
+                cols_to_drop_actual.append(col)
+        
+        if cols_to_drop_actual:
+            df = df.drop(columns=cols_to_drop_actual)
+        
+        # 确保日期列存在且为datetime类型
+        if '日期' in df.columns:
+            df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
+            df = df.dropna(subset=['日期'])  # 删除日期为空的记录
+        
+        if df.empty:
+            return None, None, None, "删除无效日期后数据为空"
+        
+        # 【v0.4新增】判断市场类型（使用Excel第一行的股票代码，可能包含后缀）
+        market_type = determine_market(extracted_stock_code)
+        
+        # 【v0.4新增】合并指数数据（在添加公司标识列之前）
+        if market_type in MARKET_INDEX_MAPPING and index_data_dict:
+            df = merge_index_data(df, market_type, index_data_dict)
+        
+        # 【v0.4修复】添加公司标识列，确保填充所有行
+        # stock_code列使用Excel第一行的值（与v0.3逻辑一致）
+        df['sequence_id'] = company_info['sequence_id']
+        df['company_name'] = company_info['company_name']
+        df['stock_code'] = extracted_stock_code
+        
+        # 【v0.4修复】添加货币单位列，确保填充所有行
+        mapped_currency = map_currency_unit(extracted_currency)
+        if mapped_currency is not None:
+            df['货币单位'] = mapped_currency
+        else:
+            # 如果映射失败，尝试从数据中获取第一个有效值
+            df['货币单位'] = 1  # 默认为1（人民币）
+        
+        return df, company_info, market_type, None
+        
+    except Exception as e:
+        error_msg = f"处理失败: {str(e)}"
+        return None, None, None, error_msg
+
+
+def map_currency_unit(value):
+    """
+    将货币单位描述映射为训练时使用的数值
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    normalized = raw.replace(' ', '').upper()
+    mapping = {
+        '人民币': 1,
+        'RMB': 1,
+        'CNY': 1,
+        'USD': 7,
+        '美元': 7,
+        'HKD': 0.9,
+        '港币': 0.9
+    }
+    for token, num in mapping.items():
+        if token in normalized:
+            return num
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def align_columns(df, column_order):
+    """
+    确保每个文件包含统一列结构
+    【v0.5修改】保持Excel原始列顺序，公司标识列和指数列放在最前面
+    """
+    # 分离公司标识列、指数列和其他列
+    company_cols = [col for col in COMPANY_IDENTITY_COLS if col in df.columns]
+    
+    # 识别指数列（列名以指数名称开头）
+    index_cols = []
+    for col in df.columns:
+        for indices in MARKET_INDEX_MAPPING.values():
+            for index_name in indices:
+                if col.startswith(f"{index_name}_"):
+                    index_cols.append(col)
+                    break
+    
+    # 其他列（Excel原始列，按column_order顺序）
+    other_cols = [col for col in column_order if col not in company_cols and col not in index_cols]
+    
+    # 构建最终列顺序：公司标识列 -> 指数列 -> Excel原始列 -> 其他未在column_order中的列
+    final_order = company_cols + index_cols + other_cols
+    
+    # 添加未在column_order中的列（如果有）
+    remaining_cols = [col for col in df.columns if col not in final_order]
+    final_order.extend(remaining_cols)
+    
+    # 确保所有列都存在
+    for col in final_order:
+        if col not in df.columns:
+            df[col] = None
+    
+    return df[final_order]
+
+
+def get_all_excel_files(excel_dir):
+    """
+    获取所有数字开头的Excel文件
+    """
+    excel_dir = Path(excel_dir)
+    excel_files = []
+    
+    for file_path in excel_dir.glob("*.xlsx"):
+        filename = file_path.name
+        # 检查是否以数字开头
+        if re.match(r'^\d+_', filename):
+            excel_files.append(file_path)
+    
+    # 按文件名开头的数字进行数值排序（而不是字符串排序）
+    excel_files.sort(key=lambda x: int(re.match(r'^(\d+)_', x.name).group(1)))
+    
+    return excel_files
+
+
+def collect_all_columns(excel_files, sample_size=10):
+    """
+    扫描所有文件，收集所有可能的列名
+    【v0.5修改】保持Excel原始列顺序，不进行排序
+    """
+    print(f"\n扫描前{sample_size}个文件，收集所有列名（保持Excel原始顺序）...")
+    
+    # 从第一个文件获取基准列顺序
+    base_columns = []
+    all_columns_set = set()
+    
+    for file_path in excel_files[:sample_size]:
+        try:
+            df = pd.read_excel(file_path, sheet_name='财报_日K对齐', nrows=1)
+            columns_list = df.columns.tolist()
+            
+            # 第一个文件作为基准顺序
+            if not base_columns:
+                base_columns = columns_list.copy()
+            
+            # 收集所有列名
+            all_columns_set.update(columns_list)
+            
+        except Exception as e:
+            print(f"  警告: 无法读取 {file_path.name}: {e}")
+    
+    if not base_columns:
+        print("  错误: 无法读取任何文件的列信息")
+        return []
+    
+    # 从基准列顺序中移除要删除的列
+    excel_columns = [col for col in base_columns 
+                     if col not in COLS_TO_DROP and col not in COLS_TO_EXTRACT]
+    
+    # 添加后续文件中发现的新列（不在基准顺序中的列）
+    for col in all_columns_set:
+        if col not in COLS_TO_DROP and col not in COLS_TO_EXTRACT:
+            if col not in excel_columns:
+                excel_columns.append(col)
+    
+    # 构建最终列顺序：公司标识列在最前面，然后是Excel原始列
+    # 注意：指数列会在merge_index_data时动态添加，这里不包含
+    column_list = excel_columns.copy()
+    
+    print(f"  找到 {len(column_list)} 个Excel原始列（保持原始顺序）")
+    print(f"  公司标识列将放在最前面: {COMPANY_IDENTITY_COLS}")
+    
+    return column_list
+
+
+def process_all_files(excel_dir, output_dir, index_data_dict):
+    """
+    逐个处理Excel文件，并为每家公司生成独立Parquet。
+    v0.5: 保持Excel原始列顺序，公司标识列和指数列放在最前面
+    """
+    print("="*80)
+    print("开始处理Excel文件")
+    print("="*80)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    excel_files = get_all_excel_files(excel_dir)
+    total_files = len(excel_files)
+    print(f"\n找到 {total_files} 个Excel文件")
+
+    if total_files == 0:
+        print("错误: 未找到任何Excel文件")
+        return
+
+    all_columns = collect_all_columns(excel_files)
+    columns_seen = set(all_columns)
+
+    company_mapping = {}
+    processing_log = []
+
+    stats = {
+        'total_files': total_files,
+        'processed': 0,
+        'success': 0,
+        'failed': 0,
+        'total_rows': 0,
+        'errors': [],
+        'earliest_date': None,
+        'latest_date': None,
+        'market_distribution': {'A股': 0, '港股': 0, '美股': 0, 'Unknown': 0}
+    }
+
+    missing_before_total = 0
+    missing_after_total = 0
+    filled_numeric_columns = set()
+    index_columns_added = set()
+
+    print(f"\n开始处理文件...")
+    print(f"批次大小: {BATCH_SIZE}")
+
+    for batch_start in range(0, total_files, BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, total_files)
+        batch_files = excel_files[batch_start:batch_end]
+
+        print(f"\n处理批次 {batch_start//BATCH_SIZE + 1}: 文件 {batch_start+1}-{batch_end}/{total_files}")
+
+        for file_path in batch_files:
+            filename = file_path.name
+            filename_info = parse_filename(filename)
+
+            if filename_info is None:
+                error_msg = f"文件名格式无法解析: {filename}"
+                stats['failed'] += 1
+                stats['errors'].append(error_msg)
+                processing_log.append({
+                    'file': filename,
+                    'status': 'failed',
+                    'error': error_msg
+                })
+                stats['processed'] += 1
+                print(f"  ✗ {filename}: {error_msg}")
+                continue
+
+            df, company_info, market_type, error = process_single_file(file_path, filename_info, index_data_dict)
+
+            if df is None or error:
+                stats['failed'] += 1
+                error_msg = error or "未知错误"
+                stats['errors'].append(f"{filename}: {error_msg}")
+                processing_log.append({
+                    'file': filename,
+                    'status': 'failed',
+                    'error': error_msg
+                })
+                stats['processed'] += 1
+                print(f"  ✗ {filename}: {error_msg}")
+                continue
+
+            stats['success'] += 1
+            stats['total_rows'] += len(df)
+            
+            # 统计市场分布
+            if market_type:
+                stats['market_distribution'][market_type] = stats['market_distribution'].get(market_type, 0) + 1
+
+            # 【v0.5修改】对齐列，保持Excel原始顺序，公司标识列和指数列在最前面
+            df = align_columns(df, all_columns)
+            columns_seen.update(df.columns.tolist())
+            
+            # 记录新增的指数列
+            for col in df.columns:
+                for indices in MARKET_INDEX_MAPPING.values():
+                    for index_name in indices:
+                        if col.startswith(f"{index_name}_"):
+                            index_columns_added.add(col)
+
+            if '日期' in df.columns:
+                df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
+                df = df.dropna(subset=['日期'])
+
+            numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
+            for col in numeric_cols:
+                if col not in ['sequence_id']:
+                    df[col] = df[col].astype('float32')
+
+            if 'sequence_id' in df.columns:
+                df['sequence_id'] = df['sequence_id'].astype('int32')
+
+            # 填充原有数值列的缺失值（不包括指数列，指数列已经填充过了）
+            numeric_fill_cols = df.select_dtypes(include=['float32', 'float64']).columns
+            fill_cols = [col for col in numeric_fill_cols if col not in ['sequence_id'] and not any(col.startswith(f"{idx}_") for indices in MARKET_INDEX_MAPPING.values() for idx in indices)]
+            filled_numeric_columns.update(fill_cols)
+
+            missing_before = df[fill_cols].isna().sum().sum() if fill_cols else 0
+            if fill_cols:
+                df[fill_cols] = df[fill_cols].fillna(0)
+            missing_after = df[fill_cols].isna().sum().sum() if fill_cols else 0
+            missing_before_total += int(missing_before)
+            missing_after_total += int(missing_after)
+
+            if '日期' in df.columns and not df['日期'].empty:
+                df = df.sort_values('日期', ascending=True).reset_index(drop=True)
+                start_date = df['日期'].min()
+                end_date = df['日期'].max()
+                if start_date and (stats['earliest_date'] is None or start_date < stats['earliest_date']):
+                    stats['earliest_date'] = start_date
+                if end_date and (stats['latest_date'] is None or end_date > stats['latest_date']):
+                    stats['latest_date'] = end_date
+            else:
+                start_date = None
+                end_date = None
+
+            parquet_filename = f"{file_path.stem}.parquet"
+            parquet_path = output_dir / parquet_filename
+            df.to_parquet(parquet_path, engine='pyarrow', compression='snappy', index=False)
+
+            company_id = filename_info['sequence_id']
+            mapping_entry = company_info.copy()
+            mapping_entry['parquet_file'] = parquet_filename
+            mapping_entry['market_type'] = market_type
+            company_mapping[company_id] = mapping_entry
+
+            processing_log.append({
+                'file': filename,
+                'status': 'success',
+                'rows': len(df),
+                'parquet_file': parquet_filename,
+                'market_type': market_type,
+                'date_range': {
+                    'start': str(start_date) if start_date is not None else None,
+                    'end': str(end_date) if end_date is not None else None
+                }
+            })
+
+            if stats['success'] % 10 == 0:
+                print(f"  ✓ 已处理 {stats['success']} 个文件，当前: {filename} ({len(df)} 行, {market_type})")
+
+            stats['processed'] += 1
+
+    if stats['success'] == 0:
+        print("错误: 没有成功处理任何文件")
+        return
+
+    print("\n生成元数据...")
+    metadata = {
+        'version': METADATA_VERSION,
+        'processing_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'total_rows': stats['total_rows'],
+        'total_companies': len(company_mapping),
+        'date_range': {
+            'start': str(stats['earliest_date']) if stats['earliest_date'] is not None else None,
+            'end': str(stats['latest_date']) if stats['latest_date'] is not None else None
+        },
+        'columns': {
+            'total': len(columns_seen),
+            'list': sorted(columns_seen),  # 元数据中仍按字母顺序列出，便于查看
+            'date_columns': ['日期'],
+            'company_columns': COMPANY_IDENTITY_COLS,
+            'column_order_preserved': True  # v0.5新增：标记已保持列顺序
+        },
+        'statistics': {
+            'total_files': stats['total_files'],
+            'processed': stats['processed'],
+            'success': stats['success'],
+            'failed': stats['failed'],
+            'success_rate': f"{(stats['success']/stats['total_files']*100) if stats['total_files'] else 0:.2f}%",
+            'market_distribution': stats['market_distribution']
+        },
+        'missing_value_filling': {
+            'enabled': True,
+            'method': 'fillna(0)',
+            'columns_filled': len(filled_numeric_columns),
+            'missing_values_before': missing_before_total,
+            'missing_values_after': missing_after_total
+        },
+        'index_data': {
+            'enabled': len(index_data_dict) > 0,
+            'source_file': INDEX_FILE_PATH,
+            'index_mapping': MARKET_INDEX_MAPPING,
+            'indices_loaded': list(index_data_dict.keys()),
+            'index_columns_added': sorted(index_columns_added),
+            'index_columns_count': len(index_columns_added),
+            'missing_value_strategy': 'fillna(0)'
+        }
+    }
+
+    metadata_path = output_dir / f"data_metadata_{VERSION_SUFFIX}.json"
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    print(f"  ✓ 已保存: {metadata_path}")
+
+    company_mapping_path = output_dir / f"company_mapping_{VERSION_SUFFIX}.json"
+    with open(company_mapping_path, 'w', encoding='utf-8') as f:
+        json.dump(company_mapping, f, ensure_ascii=False, indent=2)
+    print(f"  ✓ 已保存: {company_mapping_path}")
+
+    log_path = output_dir / f"processing_log_{VERSION_SUFFIX}.txt"
+    with open(log_path, 'w', encoding='utf-8') as f:
+        f.write(f"数据处理日志 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("="*80 + "\n\n")
+        f.write(f"版本: {METADATA_VERSION}\n")
+        f.write(f"总计文件数: {stats['total_files']}\n")
+        f.write(f"成功处理: {stats['success']}\n")
+        f.write(f"处理失败: {stats['failed']}\n")
+        f.write(f"总数据行数: {stats['total_rows']}\n")
+        f.write(f"\n市场分布:\n")
+        for market, count in stats['market_distribution'].items():
+            f.write(f"  {market}: {count} 家公司\n")
+        f.write(f"\n指数数据合并:\n")
+        f.write(f"  指数数据源: {INDEX_FILE_PATH}\n")
+        f.write(f"  成功加载指数: {len(index_data_dict)}\n")
+        f.write(f"  新增指数列数: {len(index_columns_added)}\n")
+        f.write(f"\n列顺序:\n")
+        f.write(f"  保持Excel原始列顺序: 是\n")
+        f.write(f"  公司标识列位置: 最前面\n")
+        f.write(f"  指数列位置: 公司标识列之后\n")
+        f.write(f"\n缺失值填充:\n")
+        f.write(f"  填充前缺失值总数: {missing_before_total:,}\n")
+        f.write(f"  填充后缺失值总数: {missing_after_total:,}\n")
+        f.write(f"  填充列数: {len(filled_numeric_columns)}\n\n")
+
+        if stats['errors']:
+            f.write("错误列表:\n")
+            f.write("-"*80 + "\n")
+            for error in stats['errors'][:50]:
+                f.write(f"{error}\n")
+            if len(stats['errors']) > 50:
+                f.write(f"... 还有 {len(stats['errors']) - 50} 个错误未显示\n")
+
+    print(f"  ✓ 已保存: {log_path}")
+
+    print("\n" + "="*80)
+    print("处理完成！")
+    print("="*80)
+    print(f"总计文件数: {stats['total_files']}")
+    print(f"成功处理: {stats['success']}")
+    print(f"处理失败: {stats['failed']}")
+    print(f"总数据行数: {stats['total_rows']:,}")
+    print(f"公司数量: {len(company_mapping)}")
+    print(f"\n市场分布:")
+    for market, count in stats['market_distribution'].items():
+        if count > 0:
+            print(f"  {market}: {count} 家公司")
+    if stats['earliest_date'] and stats['latest_date']:
+        print(f"\n日期范围: {stats['earliest_date']} 到 {stats['latest_date']}")
+    print(f"列数: {len(columns_seen)}")
+    print(f"缺失值填充: {missing_before_total:,} -> {missing_after_total:,}")
+    print(f"\n指数数据:")
+    print(f"  成功加载: {len(index_data_dict)} 个指数")
+    print(f"  新增列数: {len(index_columns_added)}")
+    print(f"\n列顺序:")
+    print(f"  保持Excel原始列顺序: 是")
+    print(f"  公司标识列位置: 最前面")
+    print(f"  指数列位置: 公司标识列之后")
+    print(f"\n输出目录: {output_dir}")
+
+
+def main():
+    """主函数"""
+    # 获取脚本所在目录
+    script_dir = Path(__file__).parent.parent
+    excel_dir = script_dir / EXCEL_DIR
+    output_dir = script_dir / OUTPUT_DIR
+    index_file = script_dir / INDEX_FILE_PATH
+    
+    if not excel_dir.exists():
+        print(f"错误: Excel目录不存在: {excel_dir}")
+        return
+    
+    print(f"Excel目录: {excel_dir}")
+    print(f"输出目录: {output_dir}")
+    print(f"指数文件: {index_file}")
+    
+    # 预加载指数数据
+    index_data_dict = load_all_index_data(index_file)
+    
+    # 处理所有文件
+    process_all_files(excel_dir, output_dir, index_data_dict)
+
+
+if __name__ == "__main__":
+    main()
+

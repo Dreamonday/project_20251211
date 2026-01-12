@@ -1,0 +1,45 @@
+# TSMixer 模型配置文件（深度残差版本）
+# 版本: v0.2
+# 日期: 20251226
+
+metadata:
+  version: "v0.2"
+  date: "20251226"
+  description: "TSMixer模型配置 - 深度残差架构，支持可选的LayerNorm和残差连接"
+
+model:
+  name: "tsmixer"
+  
+  # 输入输出维度（会自动根据实际数据调整，这里的值只是初始值）
+  seq_len: 100          # 输入序列长度（会自动检测并更新）
+  n_features: 64        # 特征数量（会自动检测并更新，无需手动修改）
+  prediction_len: 1     # 预测长度（输出维度）
+  
+  # TSMixer架构参数
+  n_blocks: 3           # TSMixer块的数量（堆叠层数，从8改为2）
+  ff_dim: 2048          # 前馈网络隐藏维度（保留以兼容，实际架构固定）
+  dropout: 0.1          # Dropout比率（仅用于下降路径）
+  activation: "gelu"    # 激活函数: "gelu" 或 "relu"
+  norm_type: "layer"    # 归一化类型（保留以兼容）
+  use_layernorm: false   # 是否启用LayerNorm（默认true）
+  use_residual: true    # 是否启用残差连接（默认true）
+  
+  # 时间维度聚合配置
+  temporal_aggregation:
+    use_attention: false  # 使用简单平均池化
+  
+  # 输出投影配置
+  output_projection:
+    hidden_dim: 20      # 输出投影层隐藏维度（保留以兼容，实际架构固定）
+
+# 架构说明：
+# - TSMixer块：时间混合 + 特征混合，每个混合块使用多层残差网络
+# - 上升路径：初始维度 → 512 → 1024（每个维度有5层残差模块）
+# - 下降路径：1024 → 512 → 初始维度（每个维度有5层残差模块）
+# - 最高维度：1024（已删除2048层）
+# - LayerNorm：在时间混合和特征混合前各有一个LayerNorm（可通过use_layernorm控制）
+# - 残差连接：TSMixerBlock内部支持残差连接（可通过use_residual控制）
+# - 时间聚合：简单平均池化，聚合前有LayerNorm（如果启用）
+# - 输出投影：64维残差 → 32维残差 → 1（多层残差降维）
+
+

@@ -1,0 +1,33 @@
+# TSMixer 模型配置文件
+# 版本: v0.2
+# 日期: 20251225
+
+metadata:
+  version: "v0.2"
+  date: "20251225"
+  description: "TSMixer模型配置 - 基于MLP的时间序列预测模型"
+
+model:
+  name: "tsmixer"
+  
+  # 输入输出维度（会自动根据实际数据调整，这里的值只是初始值）
+  seq_len: 100          # 输入序列长度（会自动检测并更新）
+  n_features: 40        # 特征数量（会自动检测并更新，无需手动修改）
+  prediction_len: 1     # 预测长度（输出维度）
+  
+  # TSMixer架构参数
+  n_blocks: 8           # TSMixer块的数量（堆叠层数）
+  ff_dim: 2048          # 前馈网络隐藏维度
+  dropout: 0.1          # Dropout比率
+  activation: "gelu"    # 激活函数: "gelu" 或 "relu"
+  norm_type: "layer"    # 归一化类型: "layer" (LayerNorm)
+  
+  # 时间维度聚合配置
+  temporal_aggregation:
+    use_attention: false  # 是否使用注意力聚合（false=简单平均池化，更稳定）
+  
+  # 输出投影配置
+  output_projection:
+    hidden_dim: 20      # 输出投影层隐藏维度（默认为n_features的一半）
+
+

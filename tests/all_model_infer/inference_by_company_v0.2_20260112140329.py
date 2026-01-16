@@ -38,8 +38,8 @@ sys.path.insert(0, str(project_root))
 
 
 # ===== 模型和数据配置（修改此处） =====
-MODEL_DIR = "/data/project_20251211/experiments/timexer_v0.4_20260112172452_20260112120624_500120_more_continueTV"
-PREPROCESSED_DATA_DIR = "/data/project_20251211/data/processed/preprocess_data_v0.5_20260112120624_500120_more_continueTV"
+MODEL_DIR = "/data/project_20251211/experiments/timexer_v0.4_20260116151051_20260116142052_500120"
+PREPROCESSED_DATA_DIR = "/data/project_20251211/data/processed/preprocess_data_v0.7_20260116142052_500120"
 DEVICE = 'cuda'  # 或 'cpu'
 BATCH_SIZE = 256  # 推理批次大小
 

@@ -14,7 +14,7 @@ dataset:
   val_index_file: "val_samples_index.parquet"
   
   # 数据路径
-  data_dir: "/data/project_20251211/data/raw/processed_data_20251212"
+  data_dir: "/data/project_20251211/data/raw/processed_data_20251220"
   
   # 特征配置
   features:

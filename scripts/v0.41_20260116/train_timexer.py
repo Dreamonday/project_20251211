@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 主训练脚本（集成TensorBoard）- TimeXer版本（双分支架构）
-版本: v0.4
-日期: 20260106
+版本: v0.41
+日期: 20260116
 
 整合所有模块，作为训练入口，支持TensorBoard可视化
 使用TimeXer双分支模型进行时间序列预测（内生+宏观，交叉注意力融合）
+支持细粒度LayerNorm控制（v0.41新增）
 """
 
 import torch
@@ -49,8 +50,8 @@ def _load_module(module_path: Path, module_name: str):
     spec.loader.exec_module(module)
     return module
 
-# 导入所需模块（使用v0.4_20260106版本的模型，v0.2_20251226版本的trainer，v0.1版本的数据和utils）
-models_path = project_root / "src" / "models" / "v0.4_20260106"
+# 导入所需模块（使用v0.41_20260116版本的模型，v0.2_20251226版本的trainer，v0.1版本的数据和utils）
+models_path = project_root / "src" / "models" / "v0.41_20260116"
 data_path = project_root / "src" / "data" / "v0.1_20251212"
 training_path = project_root / "src" / "training" / "v0.2_20251226"
 utils_path = project_root / "src" / "utils" / "v0.1_20251212"
@@ -212,8 +213,8 @@ def get_latest_code_modify_time(config_version: str) -> str:
     train_script = Path(__file__)
     files_to_check.append(train_script)
     
-    # 2. 模型文件（使用v0.4_20260106版本）
-    models_path = project_root / "src" / "models" / "v0.4_20260106"
+    # 2. 模型文件（使用v0.41_20260116版本）
+    models_path = project_root / "src" / "models" / "v0.41_20260116"
     files_to_check.append(models_path / "timexer.py")
     files_to_check.append(models_path / "timexer_blocks.py")
     
@@ -402,7 +403,7 @@ def get_data_generation_time(preprocessed_dir: Path = None, dataset_config: dict
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='训练TimeXer模型（双分支架构，交叉注意力融合，集成TensorBoard）')
-    parser.add_argument('--config_version', type=str, default='v0.4_20260106',
+    parser.add_argument('--config_version', type=str, default='v0.41_20260116',
                         help='配置版本号')
     parser.add_argument('--model_config', type=str, default=None,
                         help='模型配置文件路径（可选，默认使用config_version）')

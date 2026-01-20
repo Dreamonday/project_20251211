@@ -13,7 +13,7 @@
 7. 生成元数据、公司映射和处理日志
 8. 【v0.4新增】根据股票市场类型（A股/港股/美股）添加对应的指数数据
 9. 【v0.4新增】确保股票代码和货币单位列填充所有行
-10. 【v0.5新增】保持Excel原始列顺序，公司标识列和指数列放在最前面
+10. 【v0.5新增】保持Excel原始列顺序，公司标识列放在最前面，指数列放在最后面
 
 输出：
 - {原Excel文件名}.parquet: 每家公司的预处理数据（包含指数数据）
@@ -30,13 +30,13 @@ from pathlib import Path
 
 # =========================== 配置区域 ===========================
 # Excel文件所在目录
-EXCEL_DIR = "01上市公司财务数据与日K融合-陈俊同-20251220"
+EXCEL_DIR = "01上市公司财务数据与日K融合-陈俊同-20260118"
 
 # 输出目录
-OUTPUT_DIR = "preprocessing_data_20251209/processed_data_20251220"
+OUTPUT_DIR = "preprocessing_data_20251209/processed_data_20260118"
 
 # 指数数据文件路径
-INDEX_FILE_PATH = "macro_index_v0.1_20251220_220156.xlsx"
+INDEX_FILE_PATH = "macro_index_v0.1_20260118_121557.xlsx"
 
 # 版本信息
 VERSION_SUFFIX = "v0.5"
@@ -411,7 +411,7 @@ def map_currency_unit(value):
 def align_columns(df, column_order):
     """
     确保每个文件包含统一列结构
-    【v0.5修改】保持Excel原始列顺序，公司标识列和指数列放在最前面
+    【v0.5修改】保持Excel原始列顺序，公司标识列放在最前面，指数列放在最后面
     """
     # 分离公司标识列、指数列和其他列
     company_cols = [col for col in COMPANY_IDENTITY_COLS if col in df.columns]
@@ -428,8 +428,8 @@ def align_columns(df, column_order):
     # 其他列（Excel原始列，按column_order顺序）
     other_cols = [col for col in column_order if col not in company_cols and col not in index_cols]
     
-    # 构建最终列顺序：公司标识列 -> 指数列 -> Excel原始列 -> 其他未在column_order中的列
-    final_order = company_cols + index_cols + other_cols
+    # 构建最终列顺序：公司标识列 -> Excel原始列 -> 指数列 -> 其他未在column_order中的列
+    final_order = company_cols + other_cols + index_cols
     
     # 添加未在column_order中的列（如果有）
     remaining_cols = [col for col in df.columns if col not in final_order]
@@ -515,7 +515,7 @@ def collect_all_columns(excel_files, sample_size=10):
 def process_all_files(excel_dir, output_dir, index_data_dict):
     """
     逐个处理Excel文件，并为每家公司生成独立Parquet。
-    v0.5: 保持Excel原始列顺序，公司标识列和指数列放在最前面
+    v0.5: 保持Excel原始列顺序，公司标识列放在最前面，指数列放在最后面
     """
     print("="*80)
     print("开始处理Excel文件")
@@ -603,7 +603,7 @@ def process_all_files(excel_dir, output_dir, index_data_dict):
             if market_type:
                 stats['market_distribution'][market_type] = stats['market_distribution'].get(market_type, 0) + 1
 
-            # 【v0.5修改】对齐列，保持Excel原始顺序，公司标识列和指数列在最前面
+            # 【v0.5修改】对齐列，保持Excel原始顺序，公司标识列在最前面，指数列在最后面
             df = align_columns(df, all_columns)
             columns_seen.update(df.columns.tolist())
             
@@ -753,7 +753,7 @@ def process_all_files(excel_dir, output_dir, index_data_dict):
         f.write(f"\n列顺序:\n")
         f.write(f"  保持Excel原始列顺序: 是\n")
         f.write(f"  公司标识列位置: 最前面\n")
-        f.write(f"  指数列位置: 公司标识列之后\n")
+        f.write(f"  指数列位置: 最后面\n")
         f.write(f"\n缺失值填充:\n")
         f.write(f"  填充前缺失值总数: {missing_before_total:,}\n")
         f.write(f"  填充后缺失值总数: {missing_after_total:,}\n")
@@ -791,7 +791,7 @@ def process_all_files(excel_dir, output_dir, index_data_dict):
     print(f"\n列顺序:")
     print(f"  保持Excel原始列顺序: 是")
     print(f"  公司标识列位置: 最前面")
-    print(f"  指数列位置: 公司标识列之后")
+    print(f"  指数列位置: 最后面")
     print(f"\n输出目录: {output_dir}")
 
 

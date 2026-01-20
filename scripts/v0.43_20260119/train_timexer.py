@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 主训练脚本（集成TensorBoard）- TimeXer版本（双分支架构）
-版本: v0.4
-日期: 20260106
+版本: v0.43
+日期: 20260119
 
 整合所有模块，作为训练入口，支持TensorBoard可视化
 使用TimeXer双分支模型进行时间序列预测（内生+宏观，交叉注意力融合）
+
+v0.43新增：学习型Missing Embedding，在模型内部自动处理-1000缺失值
 """
 
 import torch
@@ -30,12 +32,13 @@ sys.path.insert(0, str(project_root))
 
 
 # ===== 默认训练数据路径（如需调整请修改此处） =====
-DEFAULT_PREPROCESSED_DIR = project_root / "data" / "processed" / "preprocess_data_v0.9_20260118121436_500120"
+DEFAULT_PREPROCESSED_DIR = project_root / "data" / "processed" / "preprocess_data_v0.51_20260120092547"
 
 # ===== 数据设备配置（如需调整请修改此处） =====
 # 选项: 'cpu' 或 'cuda'
 # - 'cpu': 数据存储在CPU内存中，训练时通过pin_memory传输到GPU（推荐，支持多进程加载）
 # - 'cuda': 数据直接存储在GPU显存中，训练时无需传输（更快，但需要显存充足，且num_workers必须为0）
+# 注意: 使用内存映射模式（mmap_mode=True）时，数据自动使用CPU，此配置被忽略
 DATA_DEVICE = 'cpu'  # 修改此处: 'cpu' 或 'cuda'
 
 
@@ -49,10 +52,10 @@ def _load_module(module_path: Path, module_name: str):
     spec.loader.exec_module(module)
     return module
 
-# 导入所需模块（使用v0.4_20260106版本的模型，v0.2_20251226版本的trainer，v0.1版本的数据和utils）
-models_path = project_root / "src" / "models" / "v0.4_20260106"
-data_path = project_root / "src" / "data" / "v0.1_20251212"
-training_path = project_root / "src" / "training" / "v0.2_20251226"
+# 导入所需模块（使用v0.43_20260119版本的模型，v0.3_20260118版本的trainer，v0.3_20260119版本的数据(支持mmap)，v0.1版本的utils）
+models_path = project_root / "src" / "models" / "v0.43_20260119"
+data_path = project_root / "src" / "data" / "v0.3_20260119"
+training_path = project_root / "src" / "training" / "v0.3_20260118"
 utils_path = project_root / "src" / "utils" / "v0.1_20251212"
 
 # 导入模型
@@ -150,7 +153,10 @@ def create_criterion(loss_config: dict) -> nn.Module:
         return nn.HuberLoss(reduction=reduction, delta=delta)
     elif loss_type == 'mape':
         epsilon = float(loss_config.get('epsilon', 1e-8))
-        return MAPELoss(reduction=reduction, epsilon=epsilon)
+        max_relative_error = loss_config.get('max_relative_error', None)
+        if max_relative_error is not None:
+            max_relative_error = float(max_relative_error)
+        return MAPELoss(reduction=reduction, epsilon=epsilon, max_relative_error=max_relative_error)
     else:
         raise ValueError(f"Unknown loss type: {loss_type}. Available: 'mse', 'mae', 'huber', 'mape'")
 
@@ -212,18 +218,19 @@ def get_latest_code_modify_time(config_version: str) -> str:
     train_script = Path(__file__)
     files_to_check.append(train_script)
     
-    # 2. 模型文件（使用v0.4_20260106版本）
-    models_path = project_root / "src" / "models" / "v0.4_20260106"
+    # 2. 模型文件（使用v0.43_20260119版本）
+    models_path = project_root / "src" / "models" / "v0.43_20260119"
     files_to_check.append(models_path / "timexer.py")
     files_to_check.append(models_path / "timexer_blocks.py")
+    # v0.43: 不需要masked_layernorm.py
     
-    # 3. 数据集文件（使用v0.1版本）
-    data_path = project_root / "src" / "data" / "v0.1_20251212"
+    # 3. 数据集文件（使用v0.3_20260119版本）
+    data_path = project_root / "src" / "data" / "v0.3_20260119"
     files_to_check.append(data_path / "stock_dataset.py")
     files_to_check.append(data_path / "preprocessed_dataset.py")
     
-    # 4. 训练器文件（使用v0.2_20251226版本）
-    training_path = project_root / "src" / "training" / config_version
+    # 4. 训练器文件（使用v0.3_20260118版本）
+    training_path = project_root / "src" / "training" / "v0.3_20260118"
     files_to_check.append(training_path / "trainer.py")
     
     # 5. 工具文件（使用v0.1版本）
@@ -243,8 +250,8 @@ def get_latest_code_modify_time(config_version: str) -> str:
         if config_file.exists():
             config_files.append(config_file)
         else:
-            # 如果当前版本不存在，尝试使用v0.1版本
-            old_config_file = project_root / "configs" / "v0.1_20251212" / config_name
+            # 如果当前版本不存在，尝试使用v0.41版本
+            old_config_file = project_root / "configs" / "v0.41_20260116" / config_name
             if old_config_file.exists():
                 config_files.append(old_config_file)
     
@@ -319,14 +326,14 @@ def extract_version_number(config_version: str) -> str:
     从config_version中提取版本号部分（去掉日期后缀）
     
     Args:
-        config_version: 配置版本号，如 'v0.2_20251226'
+        config_version: 配置版本号，如 'v0.42_20260118'
         
     Returns:
-        版本号，如 'v0.2'
+        版本号，如 'v0.42'
     """
     # 使用split分割，取第一部分（下划线前的版本号）
-    # 例如: 'v0.2_20251226' -> 'v0.2'
-    #      'v0.2_test_20251226' -> 'v0.2_test'
+    # 例如: 'v0.42_20260118' -> 'v0.42'
+    #      'v0.42_test_20260118' -> 'v0.42_test'
     parts = config_version.split('_')
     
     # 如果包含数字日期后缀，去掉最后一个部分
@@ -353,9 +360,9 @@ def get_data_generation_time(preprocessed_dir: Path = None, dataset_config: dict
     # 情况1: 使用预处理数据
     if preprocessed_dir is not None:
         # 从目录名提取时间戳及之后的所有内容
-        # 例如：preprocess_data_v0.5_20260109111857_500120 -> 20260109111857_500120
+        # 例如：preprocess_data_v0.9_20260109111857_500120 -> 20260109111857_500120
         dir_name = preprocessed_dir.name
-        # 匹配格式：preprocess_data_v0.5_后面所有内容
+        # 匹配格式：preprocess_data_v0.9_后面所有内容
         match = re.search(r'preprocess_data_v\d+\.\d+_(.+)', dir_name)
         if match:
             return match.group(1)
@@ -401,8 +408,8 @@ def get_data_generation_time(preprocessed_dir: Path = None, dataset_config: dict
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='训练TimeXer模型（双分支架构，交叉注意力融合，集成TensorBoard）')
-    parser.add_argument('--config_version', type=str, default='v0.4_20260106',
+    parser = argparse.ArgumentParser(description='训练TimeXer模型（双分支架构，交叉注意力融合，集成TensorBoard，学习型Missing Embedding）')
+    parser.add_argument('--config_version', type=str, default='v0.43_20260119',
                         help='配置版本号')
     parser.add_argument('--model_config', type=str, default=None,
                         help='模型配置文件路径（可选，默认使用config_version）')
@@ -427,7 +434,7 @@ def main():
     config_dir = project_root / "configs" / args.config_version
     
     # 优先使用命令行指定的配置，否则使用config_version目录下的配置
-    # 如果config_version目录下不存在，则回退到v0.1_20251212
+    # 如果config_version目录下不存在，则回退到v0.1_20251212（包含完整的配置文件）
     fallback_config_dir = project_root / "configs" / "v0.1_20251212"
     
     # 模型配置
@@ -436,7 +443,7 @@ def main():
     elif (config_dir / "timexer_config.yaml").exists():
         model_config_path = str(config_dir / "timexer_config.yaml")
     else:
-        model_config_path = str(fallback_config_dir / "tsmixer_config.yaml")
+        model_config_path = str(fallback_config_dir / "timexer_config.yaml")
     
     # 训练配置
     if args.training_config:
@@ -455,7 +462,7 @@ def main():
         dataset_config_path = str(fallback_config_dir / "dataset_config.yaml")
     
     print("=" * 80)
-    print("TimeXer 训练脚本 (双分支架构 + 交叉注意力融合 + TensorBoard)")
+    print("TimeXer 训练脚本 v0.43 (双分支 + 交叉注意力 + TensorBoard + 学习型Missing Embedding)")
     print("=" * 80)
     print(f"模型配置: {model_config_path}")
     print(f"训练配置: {training_config_path}")
@@ -476,11 +483,15 @@ def main():
     tb_config = training_config.get('tensorboard', {})
     tb_enabled = tb_config.get('enabled', True)
     
-    # 获取代码最新修改时间
+    # 获取代码运行时间（用于目录命名，确保每次运行都是独立的）
     config_version = args.config_version
-    print("\n获取代码最新修改时间...")
-    code_timestamp = get_latest_code_modify_time(config_version)
-    print(f"代码最新修改时间: {code_timestamp}")
+    print("\n获取代码运行时间...")
+    run_timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    print(f"代码运行时间: {run_timestamp}")
+    
+    # 同时获取代码最新修改时间（用于记录到元数据）
+    code_modify_timestamp = get_latest_code_modify_time(config_version)
+    print(f"代码最新修改时间: {code_modify_timestamp}")
     
     # 初始化数据集
     print("\n初始化数据集...")
@@ -488,8 +499,8 @@ def main():
     # 判断是否使用预处理数据
     preprocessed_dir = DEFAULT_PREPROCESSED_DIR
     if args.use_preprocessed:
-        # ===== 使用预处理数据（快速模式） =====
-        print("使用预处理数据（快速模式）")
+        # ===== 使用预处理数据（快速模式，支持mask + 内存映射） =====
+        print("使用预处理数据（快速模式，支持mask + 内存映射优化）")
         
         # 确定预处理数据目录
         if args.preprocessed_dir:
@@ -516,27 +527,36 @@ def main():
         print("\n自动检测预处理文件...")
         train_pt_file, val_pt_file = find_preprocessed_files(preprocessed_dir)
         
-        # 加载预处理数据集
-        # 根据DATA_DEVICE配置决定数据存储位置
-        dataset_device = None if DATA_DEVICE == 'cpu' else DATA_DEVICE
+        # 加载预处理数据集（v0.3支持mask + 内存映射）
+        # 使用内存映射模式避免OOM，预计算mask充分利用CPU内存
+        print("  使用内存映射模式加载（数据保留在磁盘，按需加载到内存）")
+        print("  启用预计算mask（一次性生成所有mask，充分利用CPU内存）")
         train_dataset = PreprocessedStockDataset(
             pt_file_path=str(train_pt_file),
-            load_to_memory=True,
-            device=dataset_device
+            load_to_memory=False,  # mmap模式下忽略
+            device=None,  # 内存映射模式必须使用CPU
+            blank_value=0,  # 空白数据标记值
+            return_mask=True,  # 启用mask
+            mmap_mode=True,  # 启用内存映射（关键！）
+            precompute_mask=True  # 预计算mask，提升训练速度，充分利用CPU内存
         )
         
         val_dataset = PreprocessedStockDataset(
             pt_file_path=str(val_pt_file),
-            load_to_memory=True,
-            device=dataset_device
+            load_to_memory=False,
+            device=None,
+            blank_value=-1000.0,
+            return_mask=True,
+            mmap_mode=True,  # 启用内存映射
+            precompute_mask=True  # 预计算mask
         )
         
         # 从元数据中获取特征统计量
         feature_stats = train_dataset.get_feature_stats()
     
     else:
-        # ===== 使用原始数据（常规模式） =====
-        print("使用原始数据（常规模式）")
+        # ===== 使用原始数据（常规模式，支持mask） =====
+        print("使用原始数据（常规模式，支持mask）")
         
         # 获取数据生成时间（从索引文件目录）
         print("\n获取数据生成时间...")
@@ -564,7 +584,9 @@ def main():
             feature_stats=None,
             stats_file=None,
             cache_enabled=cache_enabled,
-            cache_size=cache_size
+            cache_size=cache_size,
+            blank_value=-1000.0,  # v0.42新增
+            return_mask=True  # v0.42新增
         )
         
         # 计算特征统计量（如果需要标准化）
@@ -583,7 +605,9 @@ def main():
                 feature_stats=feature_stats,
                 stats_file=None,
                 cache_enabled=cache_enabled,
-                cache_size=cache_size
+                cache_size=cache_size,
+                blank_value=-1000.0,
+                return_mask=True
             )
         
         # 创建验证集
@@ -596,15 +620,20 @@ def main():
             feature_stats=feature_stats,
             stats_file=stats_file,
             cache_enabled=cache_enabled,
-            cache_size=cache_size
+            cache_size=cache_size,
+            blank_value=-1000.0,
+            return_mask=True
         )
     
-    # 创建输出目录（使用代码修改时间和数据生成时间）
+    # 创建输出目录（使用代码运行时间和数据生成时间）
     # 从config_version中提取版本号部分（去掉日期后缀）
     version_number = extract_version_number(config_version)
-    output_dir = project_root / "experiments" / f"timexer_{version_number}_{code_timestamp}_{data_timestamp}"
+    output_dir = project_root / "experiments" / f"timexer_{version_number}_{run_timestamp}_{data_timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n输出目录: {output_dir}")
+    print(f"  运行时间戳: {run_timestamp}")
+    print(f"  数据时间戳: {data_timestamp}")
+    print(f"  代码修改时间戳: {code_modify_timestamp}")
     
     # 保存特征统计量（如果需要）
     if feature_stats is not None:
@@ -665,7 +694,7 @@ def main():
     )
     
     # 初始化模型（使用更新后的配置）
-    print("\n初始化模型...")
+    print("\n初始化TimeXer模型（v0.43，学习型Missing Embedding）...")
     
     # 读取特征分离配置（优先使用索引列表）
     endogenous_indices = model_cfg.get('endogenous_indices', None)
@@ -709,6 +738,7 @@ def main():
     print(f"模型参数数量: {model.get_num_parameters():,}")
     print(f"LayerNorm: {'启用' if model.use_layernorm else '禁用'}")
     print(f"残差连接: {'启用' if model.use_residual else '禁用'}")
+    print(f"学习型Missing Embedding: 启用 (v0.43新特性，自动处理-1000缺失值)")
     
     # 创建优化器
     print("\n创建优化器...")
@@ -742,7 +772,6 @@ def main():
     if tb_enabled:
         tb_log_dir = tb_config.get('log_dir', 'tensorboard')
         # 使用完整的模型文件夹名称作为运行名称
-        # 例如: timexer_v0.4_20260107114254_20260106104708_500120
         run_name = output_dir.name
         tensorboard_dir = output_dir / tb_log_dir / run_name
         print(f"\nTensorBoard已启用")
@@ -751,8 +780,8 @@ def main():
         print(f"  记录间隔: 每 {tb_config.get('log_interval', 50)} batch")
         print(f"  直方图: {'启用' if tb_config.get('log_histograms', True) else '禁用'}")
     
-    # 创建训练器（带TensorBoard支持）
-    print("\n创建训练器...")
+    # 创建训练器（带TensorBoard支持，v0.3支持mask + 内存映射数据）
+    print("\n创建训练器（v0.3，支持mask + 内存映射数据）...")
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -783,9 +812,15 @@ def main():
     # 获取模型的详细信息
     model_info = model.get_model_info()
     
-    # 合并模型配置和详细信息
+    # 合并模型配置和详细信息，并添加运行时元数据
     detailed_model_config = {
-        'metadata': model_config.get('metadata', {}),
+        'metadata': {
+            **model_config.get('metadata', {}),
+            'run_timestamp': run_timestamp,  # 代码运行时间
+            'code_modify_timestamp': code_modify_timestamp,  # 代码最后修改时间
+            'data_timestamp': data_timestamp,  # 数据生成时间
+            'output_directory': str(output_dir)  # 输出目录
+        },
         'model': {
             **model_config.get('model', {}),
             **model_info  # 添加详细的模型信息
@@ -829,4 +864,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

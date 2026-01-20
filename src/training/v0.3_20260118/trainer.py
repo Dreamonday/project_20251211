@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-训练器类（集成TensorBoard）
-版本: v0.2
-日期: 20251226
+训练器类（集成TensorBoard，支持mask）
+版本: v0.3
+日期: 20260118
 
 封装训练循环、验证、模型保存、TensorBoard可视化等功能
-适用于TSMixer等各种模型
+适用于TSMixer、TimeXer等各种模型
+
+v0.3新增：支持mask传递，兼容带mask和不带mask的数据集
 """
 
 import torch
@@ -93,8 +95,10 @@ class EarlyStopping:
 
 class Trainer:
     """
-    训练器类（集成TensorBoard）
+    训练器类（集成TensorBoard，支持mask）
     封装训练循环、验证、模型保存、TensorBoard可视化等功能
+    
+    v0.3新增：支持mask机制，兼容v0.1和v0.2数据集
     """
     
     def __init__(
@@ -204,7 +208,7 @@ class Trainer:
     
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
-        训练一个epoch
+        训练一个epoch（支持mask）
         
         Args:
             epoch: 当前epoch编号
@@ -220,9 +224,20 @@ class Trainer:
         total_batches = len(self.train_loader)
         print_interval = max(1, total_batches // 100)  # 每1%打印一次进度
         
-        for batch_idx, (X, y) in enumerate(self.train_loader):
-            X = X.to(self.device)
-            y = y.to(self.device)
+        for batch_idx, batch_data in enumerate(self.train_loader):
+            # v0.3新增：检测数据格式
+            if len(batch_data) == 3:
+                # 支持mask的数据集（v0.2）
+                X, y, mask = batch_data
+                X = X.to(self.device)
+                y = y.to(self.device)
+                mask = mask.to(self.device)
+            else:
+                # 不支持mask的数据集（v0.1，向后兼容）
+                X, y = batch_data
+                X = X.to(self.device)
+                y = y.to(self.device)
+                mask = None
             
             # 检查输入数据是否有NaN或Inf
             if torch.isnan(X).any() or torch.isinf(X).any():
@@ -242,10 +257,10 @@ class Trainer:
             # 清零梯度
             self.optimizer.zero_grad()
             
-            # 前向传播
+            # 前向传播（传递mask）
             if self.mixed_precision:
                 with torch.amp.autocast('cuda'):
-                    pred = self.model(X)
+                    pred = self.model(X, mask=mask) if mask is not None else self.model(X)
                     loss = self.criterion(pred, y)
                 
                 # 检查模型输出和loss
@@ -270,7 +285,7 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                pred = self.model(X)
+                pred = self.model(X, mask=mask) if mask is not None else self.model(X)
                 loss = self.criterion(pred, y)
                 
                 # 检查模型输出和loss
@@ -362,7 +377,7 @@ class Trainer:
     
     def validate_epoch(self, epoch: int) -> Dict[str, float]:
         """
-        验证一个epoch
+        验证一个epoch（支持mask）
         
         Args:
             epoch: 当前epoch编号
@@ -379,17 +394,28 @@ class Trainer:
         print_interval = max(1, total_batches // 100)  # 每1%打印一次进度
         
         with torch.no_grad():
-            for batch_idx, (X, y) in enumerate(self.val_loader):
-                X = X.to(self.device)
-                y = y.to(self.device)
+            for batch_idx, batch_data in enumerate(self.val_loader):
+                # v0.3新增：检测数据格式
+                if len(batch_data) == 3:
+                    # 支持mask的数据集（v0.2）
+                    X, y, mask = batch_data
+                    X = X.to(self.device)
+                    y = y.to(self.device)
+                    mask = mask.to(self.device)
+                else:
+                    # 不支持mask的数据集（v0.1，向后兼容）
+                    X, y = batch_data
+                    X = X.to(self.device)
+                    y = y.to(self.device)
+                    mask = None
                 
-                # 前向传播
+                # 前向传播（传递mask）
                 if self.mixed_precision:
                     with torch.amp.autocast('cuda'):
-                        pred = self.model(X)
+                        pred = self.model(X, mask=mask) if mask is not None else self.model(X)
                         loss = self.criterion(pred, y)
                 else:
-                    pred = self.model(X)
+                    pred = self.model(X, mask=mask) if mask is not None else self.model(X)
                     loss = self.criterion(pred, y)
                 
                 # 记录损失（用于实时进度显示）
@@ -689,4 +715,3 @@ class Trainer:
         print(f"加载检查点: {checkpoint_path}")
         print(f"Epoch: {checkpoint.get('epoch', 'unknown')}")
         print(f"Best Val Loss: {checkpoint.get('best_val_loss', 'unknown')}")
-

@@ -1,19 +1,19 @@
 # 训练配置文件（集成TensorBoard）
-# 版本: v0.2
-# 日期: 20251226
+# 版本: v0.43
+# 日期: 20260119
 
 metadata:
-  version: "v0.2"
-  date: "20251226"
-  description: "训练配置 (集成TensorBoard可视化) - TSMixer深度残差模型"
+  version: "v0.43"
+  date: "20260119"
+  description: "训练配置 (集成TensorBoard可视化，学习型Missing Embedding) - TimeXer双分支模型"
 
 training:
   # 基础训练参数
-  batch_size: 96
+  batch_size: 96          # 在48和128之间取平衡，避免显存OOM
   num_epochs: 15
-  num_workers: 0          # 从8改为4，减少锁竞争
+  num_workers: 8          # 启用8个进程并行加载数据，充分利用CPU内存
   pin_memory: true
-  prefetch_factor: 2      # 预取批次数，提升数据加载速度
+  prefetch_factor: 6      # 每个worker预取6个batch，增加数据缓存
   persistent_workers: true # 保持worker进程，避免每个epoch重启
   
   # 优化器配置
@@ -39,8 +39,7 @@ training:
     reduction: "mean"
     # MAPE特有参数（仅当type="mape"时有效）
     epsilon: 0.01  # 防止除零的小值，增大以平滑小值样本的相对误差
-    max_relative_error: 1.0  # 裁剪MAPE上限为1.0（100%），避免极端值影响训练
-                              # 设为null或不设置表示不裁剪
+    max_relative_error: 3.0  # 裁剪相对误差上限（5.0表示500%），避免极端值主导训练
   
   # 验证和保存
   val_interval: 1        # 每N个epoch验证一次
@@ -53,7 +52,7 @@ training:
   
   # 设备配置
   device: "cuda"  # "cuda" 或 "cpu"
-  mixed_precision: false  # 是否使用混合精度训练
+  mixed_precision: false  # 禁用混合精度，避免数值不稳定
 
 # TensorBoard配置
 tensorboard:
@@ -74,6 +73,8 @@ tensorboard:
   # - Gradients/*: 梯度分布（直方图）
   # - Predictions/scatter_plot: 预测值vs真实值散点图（每5个epoch）
 
-
-
-
+# v0.43版本变更（学习型Missing Embedding）：
+# - 模型内部自动检测-1000标记的缺失值
+# - 使用可学习的embedding替换缺失值，无需显式传入mask
+# - 保持向后兼容：数据集可以返回mask，但模型会自动处理
+# - 数值稳定：避免-1000极端值污染网络，在第一个线性层前完成替换

@@ -2,21 +2,28 @@
 # -*- coding: utf-8 -*-
 """
 按公司分组的模型推理脚本
-版本: v0.2
-日期: 20260112140329
+版本: v0.3
+日期: 20260119145214
 
 功能:
 1. 支持多种模型类型（iTransformer、CrossFormer、TimeXer、TSMixer）
-2. 加载训练好的模型和对应的数据
-3. 对所有训练集和验证集样本进行推理
-4. 按公司分组，每个公司生成独立的Excel和Parquet文件
-5. 计算绝对相对误差和相对误差（有正负值）
-6. 计算每个公司训练集、验证集的统计指标（平均值和标准差）
-7. 生成公司排名文件（按不同误差指标排名）
+2. 支持TimeXer新版本：v0.41_20260116、v0.42_20260118、v0.43_20260119
+3. 加载训练好的模型和对应的数据
+4. 对所有训练集和验证集样本进行推理
+5. 按公司分组，每个公司生成独立的Excel和Parquet文件
+6. 计算绝对相对误差和相对误差（有正负值）
+7. 计算每个公司训练集、验证集的统计指标（平均值和标准差）
+8. 生成公司排名文件（按不同误差指标排名）
+
+v0.3更新：
+- 添加对TimeXer v0.41（细粒度LayerNorm控制）的支持
+- 添加对TimeXer v0.42（完整mask支持）的支持
+- 添加对TimeXer v0.43（学习型Missing Embedding）的支持
+- 改进版本检测逻辑，从目录名精确识别版本号
 
 使用方法:
     修改代码最前面的配置区域，设置MODEL_DIR和PREPROCESSED_DATA_DIR
-    然后运行: python inference_by_company_v0.2_20260112140329.py
+    然后运行: python inference_by_company_v0.3_20260119145214.py
 """
 
 import torch
@@ -38,8 +45,8 @@ sys.path.insert(0, str(project_root))
 
 
 # ===== 模型和数据配置（修改此处） =====
-MODEL_DIR = "/data/project_20251211/experiments/timexer_v0.41_20260116173721_20260116142052_500120"
-PREPROCESSED_DATA_DIR = "/data/project_20251211/data/processed/preprocess_data_v0.7_20260116142052_500120"
+MODEL_DIR = "/data/project_20251211/experiments/timexer_v0.43_20260120094726_20260120092547"
+PREPROCESSED_DATA_DIR = "/data/project_20251211/data/processed/preprocess_data_v0.51_20260120092547"
 DEVICE = 'cuda'  # 或 'cpu'
 BATCH_SIZE = 256  # 推理批次大小
 
@@ -70,29 +77,47 @@ def detect_model_type(model_dir: Path) -> tuple:
         config = yaml.safe_load(f)
     
     model_name = config.get('model', {}).get('name', '').lower()
+    dir_name = model_dir.name.lower()
     
-    # 从模型名称识别类型
+    # 优先从目录名精确识别TimeXer版本
+    if 'timexer' in model_name or 'timexer' in dir_name:
+        # 尝试从目录名提取精确版本号
+        # 匹配模式：v0.XX_YYYYMMDD
+        version_pattern = r'v0\.\d+_\d{8}'
+        match = re.search(version_pattern, dir_name)
+        if match:
+            version_str = match.group(0)
+            # 提取具体版本号（使用前缀匹配，避免日期差异导致的识别失败）
+            if version_str.startswith('v0.43_'):
+                return 'timexer', 'v0.43_20260119'
+            elif version_str.startswith('v0.42_'):
+                return 'timexer', 'v0.42_20260118'
+            elif version_str.startswith('v0.41_'):
+                return 'timexer', 'v0.41_20260116'
+            elif version_str.startswith('v0.5_'):
+                return 'timexer_mlp', 'v0.5_20260107'
+            elif version_str.startswith('v0.4_'):
+                return 'timexer', 'v0.4_20260106'
+        
+        # 如果没有匹配到，使用默认版本
+        if 'timexer_mlp' in model_name:
+            return 'timexer_mlp', 'v0.5_20260107'
+        else:
+            return 'timexer', 'v0.4_20260106'
+    
+    # 从模型名称识别其他类型
     if 'itransformer' in model_name or 'itransformer_decoder' in model_name:
         return 'itransformer', 'v0.1_20251212'
     elif 'crossformer' in model_name:
         return 'crossformer', 'v0.3_20251230'
-    elif 'timexer_mlp' in model_name:
-        return 'timexer_mlp', 'v0.5_20260107'
-    elif 'timexer' in model_name:
-        return 'timexer', 'v0.4_20260106'
     elif 'tsmixer' in model_name:
         return 'tsmixer', 'v0.2_20251226'
     else:
         # 尝试从文件夹名称识别
-        dir_name = model_dir.name.lower()
         if 'itransformer' in dir_name:
             return 'itransformer', 'v0.1_20251212'
         elif 'crossformer' in dir_name:
             return 'crossformer', 'v0.3_20251230'
-        elif 'timexer_mlp' in dir_name:
-            return 'timexer_mlp', 'v0.5_20260107'
-        elif 'timexer' in dir_name:
-            return 'timexer', 'v0.4_20260106'
         elif 'tsmixer' in dir_name:
             return 'tsmixer', 'v0.2_20251226'
         else:
@@ -206,31 +231,42 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
         timexer_module = _load_module(models_path / "timexer.py", "timexer")
         ModelClass = timexer_module.TimeXer
         
-        model = ModelClass(
-            seq_len=model_config['seq_len'],
-            n_features=model_config['n_features'],
-            prediction_len=model_config.get('prediction_len', 1),
-            endogenous_features=model_config.get('endogenous_features', 44),
-            exogenous_features=model_config.get('exogenous_features', 20),
-            endogenous_indices=model_config.get('endogenous_indices'),
-            exogenous_indices=model_config.get('exogenous_indices'),
-            endogenous_blocks=model_config.get('endogenous_blocks', 3),
-            endogenous_hidden_dim=model_config.get('endogenous_hidden_dim', 256),
-            exogenous_blocks=model_config.get('exogenous_blocks', 2),
-            exogenous_hidden_dim=model_config.get('exogenous_hidden_dim', 256),
-            shared_time_mixing=model_config.get('shared_time_mixing', True),
-            time_mixing_type=model_config.get('time_mixing_type', 'attention'),
-            time_attn_n_heads=model_config.get('time_attn_n_heads', 8),
-            use_rope=model_config.get('use_rope', True),
-            cross_attn_n_heads=model_config.get('cross_attn_n_heads', 8),
-            cross_attn_ff_dim=model_config.get('cross_attn_ff_dim', 1024),
-            dropout=model_config.get('dropout', 0.1),
-            activation=model_config.get('activation', 'gelu'),
-            use_layernorm=model_config.get('use_layernorm', True),
-            use_residual=model_config.get('use_residual', True),
-            temporal_aggregation_config=model_config.get('temporal_aggregation', {}),
-            output_projection_config=model_config.get('output_projection', {})
-        )
+        # 基础参数（所有版本通用）
+        model_params = {
+            'seq_len': model_config['seq_len'],
+            'n_features': model_config['n_features'],
+            'prediction_len': model_config.get('prediction_len', 1),
+            'endogenous_features': model_config.get('endogenous_features', 44),
+            'exogenous_features': model_config.get('exogenous_features', 20),
+            'endogenous_indices': model_config.get('endogenous_indices'),
+            'exogenous_indices': model_config.get('exogenous_indices'),
+            'endogenous_blocks': model_config.get('endogenous_blocks', 3),
+            'endogenous_hidden_dim': model_config.get('endogenous_hidden_dim', 256),
+            'exogenous_blocks': model_config.get('exogenous_blocks', 2),
+            'exogenous_hidden_dim': model_config.get('exogenous_hidden_dim', 256),
+            'shared_time_mixing': model_config.get('shared_time_mixing', True),
+            'time_mixing_type': model_config.get('time_mixing_type', 'attention'),
+            'time_attn_n_heads': model_config.get('time_attn_n_heads', 8),
+            'use_rope': model_config.get('use_rope', True),
+            'cross_attn_n_heads': model_config.get('cross_attn_n_heads', 8),
+            'cross_attn_ff_dim': model_config.get('cross_attn_ff_dim', 1024),
+            'dropout': model_config.get('dropout', 0.1),
+            'activation': model_config.get('activation', 'gelu'),
+            'use_layernorm': model_config.get('use_layernorm', True),
+            'use_residual': model_config.get('use_residual', True),
+            'temporal_aggregation_config': model_config.get('temporal_aggregation', {}),
+            'output_projection_config': model_config.get('output_projection', {})
+        }
+        
+        # v0.41 及以上版本特有参数：细粒度LayerNorm控制
+        if model_version in ['v0.41_20260116', 'v0.42_20260118', 'v0.43_20260119']:
+            model_params['use_layernorm_in_tsmixer'] = model_config.get('use_layernorm_in_tsmixer')
+            model_params['use_layernorm_in_attention'] = model_config.get('use_layernorm_in_attention')
+            model_params['use_layernorm_before_pooling'] = model_config.get('use_layernorm_before_pooling')
+        
+        # 注意：v0.42的mask支持和v0.43的Missing Embedding都是内部自动处理，不需要外部参数
+        
+        model = ModelClass(**model_params)
     
     elif model_type == 'tsmixer':
         tsmixer_module = _load_module(models_path / "tsmixer.py", "tsmixer")
@@ -865,7 +901,7 @@ def main():
     output_dir = output_base_dir / output_dir_name
     
     print("=" * 80)
-    print("按公司分组的模型推理脚本")
+    print("按公司分组的模型推理脚本 v0.3")
     print("=" * 80)
     print(f"模型目录: {model_dir}")
     print(f"预处理数据目录: {preprocessed_dir}")

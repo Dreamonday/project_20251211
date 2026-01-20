@@ -29,12 +29,15 @@ import json
 
 # ===== 配置区域（修改此处） =====
 # 数据文件夹路径
-PREPROCESSED_DATA_DIR = "/data/project_20251211/data/processed/preprocess_data_v0.5_20260112120624_500120_more_continueTV"
+PREPROCESSED_DATA_DIR = "/data/project_20251211/data/processed/preprocess_data_v0.51_20260120092547"
 
 # 需要提取的公司名称列表
 TARGET_COMPANIES = [
-    "CHINA TELECOM中國電信",
-    "TRIP.COM ‑S 攜程集團 ‑ S"
+    "贵州茅台",
+    "寒武纪-U",
+    "TENCENT騰訊控股",
+    "北方华创",
+    "国盾量子",
 ]
 
 # 是否使用模糊匹配（如果公司名称可能有细微差异）

@@ -115,7 +115,8 @@ def rmse(y_true: Union[np.ndarray, torch.Tensor],
 
 def mape(y_true: Union[np.ndarray, torch.Tensor], 
          y_pred: Union[np.ndarray, torch.Tensor],
-         epsilon: float = 1e-8) -> float:
+         epsilon: float = 1e-8,
+         max_relative_error: Optional[float] = None) -> float:
     """
     计算平均绝对百分比误差 (Mean Absolute Percentage Error)
     
@@ -123,6 +124,9 @@ def mape(y_true: Union[np.ndarray, torch.Tensor],
         y_true: 真实值
         y_pred: 预测值
         epsilon: 防止除零的小值
+        max_relative_error: 相对误差的上限（可选）
+                           例如5.0表示限制单个样本的相对误差最大为5.0（500%）
+                           None表示不裁剪，使用原始MAPE
     
     Returns:
         MAPE值（百分比形式，例如10.5表示10.5%）
@@ -131,7 +135,14 @@ def mape(y_true: Union[np.ndarray, torch.Tensor],
     
     # 避免除零
     denominator = np.abs(y_true) + epsilon
-    percentage_errors = np.abs((y_true - y_pred) / denominator) * 100
+    relative_errors = np.abs((y_true - y_pred) / denominator)
+    
+    # 裁剪相对误差（如果设置了max_relative_error）
+    if max_relative_error is not None:
+        relative_errors = np.clip(relative_errors, a_min=None, a_max=max_relative_error)
+    
+    # 转换为百分比
+    percentage_errors = relative_errors * 100
     
     return float(np.mean(percentage_errors))
 
@@ -165,7 +176,9 @@ def r2_score(y_true: Union[np.ndarray, torch.Tensor],
 def compute_metrics(
     y_true: Union[np.ndarray, torch.Tensor],
     y_pred: Union[np.ndarray, torch.Tensor],
-    metrics: Optional[list] = None
+    metrics: Optional[list] = None,
+    max_relative_error: Optional[float] = None,
+    epsilon: float = 1e-8
 ) -> Dict[str, float]:
     """
     一次性计算多个评估指标
@@ -175,6 +188,10 @@ def compute_metrics(
         y_pred: 预测值
         metrics: 要计算的指标列表，如果为None则计算所有指标
                  可选值: ["mse", "mae", "rmse", "mape", "r2"]
+        max_relative_error: MAPE的相对误差上限（可选）
+                           例如5.0表示限制单个样本的相对误差最大为5.0（500%）
+                           None表示不裁剪，使用原始MAPE
+        epsilon: MAPE计算中防止除零的小值（默认1e-8）
     
     Returns:
         指标字典，格式为 {metric_name: metric_value}
@@ -197,7 +214,13 @@ def compute_metrics(
             raise ValueError(f"Unknown metric: {metric_name}. Available: {list(metric_functions.keys())}")
         
         try:
-            metric_value = metric_functions[metric_name](y_true, y_pred)
+            # 为MAPE传递epsilon和max_relative_error参数
+            if metric_name == "mape":
+                metric_value = metric_functions[metric_name](y_true, y_pred, 
+                                                             epsilon=epsilon,
+                                                             max_relative_error=max_relative_error)
+            else:
+                metric_value = metric_functions[metric_name](y_true, y_pred)
             results[metric_name] = metric_value
         except (ValueError, ZeroDivisionError, RuntimeError) as e:
             # 如果某个指标计算失败（如数据问题、除零等），记录错误但继续计算其他指标

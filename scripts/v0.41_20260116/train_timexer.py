@@ -31,7 +31,7 @@ sys.path.insert(0, str(project_root))
 
 
 # ===== 默认训练数据路径（如需调整请修改此处） =====
-DEFAULT_PREPROCESSED_DIR = project_root / "data" / "processed" / "preprocess_data_v0.7_20260116142052_500120"
+DEFAULT_PREPROCESSED_DIR = project_root / "data" / "processed" / "preprocess_data_v1.0_20260119170929_500120"
 
 # ===== 数据设备配置（如需调整请修改此处） =====
 # 选项: 'cpu' 或 'cuda'
@@ -151,7 +151,10 @@ def create_criterion(loss_config: dict) -> nn.Module:
         return nn.HuberLoss(reduction=reduction, delta=delta)
     elif loss_type == 'mape':
         epsilon = float(loss_config.get('epsilon', 1e-8))
-        return MAPELoss(reduction=reduction, epsilon=epsilon)
+        max_relative_error = loss_config.get('max_relative_error', None)
+        if max_relative_error is not None:
+            max_relative_error = float(max_relative_error)
+        return MAPELoss(reduction=reduction, epsilon=epsilon, max_relative_error=max_relative_error)
     else:
         raise ValueError(f"Unknown loss type: {loss_type}. Available: 'mse', 'mae', 'huber', 'mape'")
 

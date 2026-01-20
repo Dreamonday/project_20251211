@@ -1,19 +1,19 @@
-# 训练配置文件（集成TensorBoard）
-# 版本: v0.2
-# 日期: 20251226
+# 训练配置文件（集成TensorBoard，支持mask）
+# 版本: v0.3
+# 日期: 20260118
 
 metadata:
-  version: "v0.2"
-  date: "20251226"
-  description: "训练配置 (集成TensorBoard可视化) - TSMixer深度残差模型"
+  version: "v0.3"
+  date: "20260118"
+  description: "训练配置 (集成TensorBoard可视化，支持mask) - TimeXer双分支模型"
 
 training:
   # 基础训练参数
-  batch_size: 96
+  batch_size: 96          # 在48和128之间取平衡，避免显存OOM
   num_epochs: 15
-  num_workers: 0          # 从8改为4，减少锁竞争
+  num_workers: 8          # 启用8个进程并行加载数据，充分利用CPU内存
   pin_memory: true
-  prefetch_factor: 2      # 预取批次数，提升数据加载速度
+  prefetch_factor: 6      # 每个worker预取6个batch，增加数据缓存
   persistent_workers: true # 保持worker进程，避免每个epoch重启
   
   # 优化器配置
@@ -38,9 +38,7 @@ training:
     type: "mape"  # "mse", "mae", "huber", "mape"
     reduction: "mean"
     # MAPE特有参数（仅当type="mape"时有效）
-    epsilon: 0.01  # 防止除零的小值，增大以平滑小值样本的相对误差
-    max_relative_error: 1.0  # 裁剪MAPE上限为1.0（100%），避免极端值影响训练
-                              # 设为null或不设置表示不裁剪
+    epsilon: 1e-8  # 防止除零的小值
   
   # 验证和保存
   val_interval: 1        # 每N个epoch验证一次
@@ -53,7 +51,7 @@ training:
   
   # 设备配置
   device: "cuda"  # "cuda" 或 "cpu"
-  mixed_precision: false  # 是否使用混合精度训练
+  mixed_precision: false  # 禁用混合精度，避免数值不稳定
 
 # TensorBoard配置
 tensorboard:
@@ -74,6 +72,11 @@ tensorboard:
   # - Gradients/*: 梯度分布（直方图）
   # - Predictions/scatter_plot: 预测值vs真实值散点图（每5个epoch）
 
-
-
-
+# v0.3版本变更（mask支持）：
+# - Trainer自动检测数据格式（2个值=无mask，3个值=有mask）
+# - 兼容v0.1数据集（PreprocessedStockDataset/StockDataset不返回mask）
+# - 兼容v0.2数据集（返回X, y, mask）
+# - 训练循环：
+#   * 如果数据集返回mask，则传递给模型
+#   * 如果数据集不返回mask，模型使用mask=None（正常模式）
+# - 向后兼容：旧数据集和旧模型可以无缝运行

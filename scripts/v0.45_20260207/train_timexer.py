@@ -2,13 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 主训练脚本（集成TensorBoard）- TimeXer版本（双分支架构）
-版本: v0.43
-日期: 20260119
+版本: v0.45
+日期: 20260207
 
 整合所有模块，作为训练入口，支持TensorBoard可视化
 使用TimeXer双分支模型进行时间序列预测（内生+宏观，交叉注意力融合）
 
-v0.43新增：学习型Missing Embedding，在模型内部自动处理-1000缺失值
+v0.45新增：Instance Normalization + 反归一化（基于v0.43）
+- 学习型Missing Embedding（继承自v0.43）
+- Instance Normalization：模型内部对输入进行归一化
+- 反归一化：输出前将预测值还原到原始尺度
+- 损失计算在原始尺度上进行
 """
 
 import torch
@@ -32,7 +36,7 @@ sys.path.insert(0, str(project_root))
 
 
 # ===== 默认训练数据路径（如需调整请修改此处） =====
-DEFAULT_PREPROCESSED_DIR = project_root / "data" / "processed" / "preprocess_data_v1.0_20260119170929_500120"
+DEFAULT_PREPROCESSED_DIR = project_root / "data" / "processed" / "preprocess_data_NaNto-1000_20260213133146"
 
 # ===== 数据设备配置（如需调整请修改此处） =====
 # 选项: 'cpu' 或 'cuda'
@@ -52,8 +56,8 @@ def _load_module(module_path: Path, module_name: str):
     spec.loader.exec_module(module)
     return module
 
-# 导入所需模块（使用v0.43_20260119版本的模型，v0.3_20260118版本的trainer，v0.3_20260119版本的数据(支持mmap)，v0.1版本的utils）
-models_path = project_root / "src" / "models" / "v0.43_20260119"
+# 导入所需模块（使用v0.45_20260207版本的模型，v0.3_20260118版本的trainer，v0.3_20260119版本的数据(支持mmap)，v0.1版本的utils）
+models_path = project_root / "src" / "models" / "v0.45_20260207"
 data_path = project_root / "src" / "data" / "v0.3_20260119"
 training_path = project_root / "src" / "training" / "v0.3_20260118"
 utils_path = project_root / "src" / "utils" / "v0.1_20251212"
@@ -257,11 +261,11 @@ def get_latest_code_modify_time(config_version: str) -> str:
     train_script = Path(__file__)
     files_to_check.append(train_script)
     
-    # 2. 模型文件（使用v0.43_20260119版本）
-    models_path = project_root / "src" / "models" / "v0.43_20260119"
+    # 2. 模型文件（使用v0.45_20260207版本）
+    models_path = project_root / "src" / "models" / "v0.45_20260207"
     files_to_check.append(models_path / "timexer.py")
     files_to_check.append(models_path / "timexer_blocks.py")
-    # v0.43: 不需要masked_layernorm.py
+    # v0.45: 不需要masked_layernorm.py
     
     # 3. 数据集文件（使用v0.3_20260119版本）
     data_path = project_root / "src" / "data" / "v0.3_20260119"
@@ -448,7 +452,7 @@ def get_data_generation_time(preprocessed_dir: Path = None, dataset_config: dict
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='训练TimeXer模型（双分支架构，交叉注意力融合，集成TensorBoard，学习型Missing Embedding）')
-    parser.add_argument('--config_version', type=str, default='v0.43_20260119',
+    parser.add_argument('--config_version', type=str, default='v0.45_20260207',
                         help='配置版本号')
     parser.add_argument('--model_config', type=str, default=None,
                         help='模型配置文件路径（可选，默认使用config_version）')
@@ -501,7 +505,7 @@ def main():
         dataset_config_path = str(fallback_config_dir / "dataset_config.yaml")
     
     print("=" * 80)
-    print("TimeXer 训练脚本 v0.43 (双分支 + 交叉注意力 + TensorBoard + 学习型Missing Embedding)")
+    print("TimeXer 训练脚本 v0.45 (双分支 + 交叉注意力 + TensorBoard + 学习型Missing Embedding)")
     print("=" * 80)
     print(f"模型配置: {model_config_path}")
     print(f"训练配置: {training_config_path}")
@@ -733,7 +737,7 @@ def main():
     )
     
     # 初始化模型（使用更新后的配置）
-    print("\n初始化TimeXer模型（v0.43，学习型Missing Embedding）...")
+    print("\n初始化TimeXer模型（v0.45，学习型Missing Embedding）...")
     
     # 应用特征分离预设方案（如果配置中指定了）
     preset = model_cfg.get('feature_split_preset', None)
@@ -781,12 +785,29 @@ def main():
         n_blocks=model_cfg.get('n_blocks', None),  # 保留以兼容，不使用
         ff_dim=model_cfg.get('ff_dim', None),  # 保留以兼容，不使用
         temporal_aggregation_config=model_cfg.get('temporal_aggregation', {}),
-        output_projection_config=model_cfg.get('output_projection', {})
+        output_projection_config=model_cfg.get('output_projection', {}),
+        # v0.45新增：Instance Normalization参数
+        use_norm=model_cfg.get('use_norm', True),
+        norm_feature_indices=model_cfg.get('norm_feature_indices', None),
+        output_feature_index=model_cfg.get('output_feature_index', 2)
     )
     print(f"模型参数数量: {model.get_num_parameters():,}")
     print(f"LayerNorm: {'启用' if model.use_layernorm else '禁用'}")
     print(f"残差连接: {'启用' if model.use_residual else '禁用'}")
-    print(f"学习型Missing Embedding: 启用 (v0.43新特性，自动处理-1000缺失值)")
+    print(f"学习型Missing Embedding: 启用 (自动处理-1000缺失值)")
+    
+    # v0.45新增：显示归一化配置
+    print(f"Instance Normalization: {'启用' if model_cfg.get('use_norm', True) else '禁用'}")
+    if model_cfg.get('use_norm', True):
+        norm_indices = model_cfg.get('norm_feature_indices', None)
+        if norm_indices is None:
+            print(f"  归一化特征: 全部 (0-{num_features-1})")
+        else:
+            print(f"  归一化特征: {len(norm_indices)}个特征")
+            print(f"  归一化索引: {norm_indices[:10]}{'...' if len(norm_indices) > 10 else ''}")
+        print(f"  输出特征索引: {model_cfg.get('output_feature_index', 2)} (用于反归一化)")
+        print(f"  反归一化: 启用 (输出还原到原始尺度)")
+        print(f"  损失计算: 原始尺度 (更符合业务含义)")
     
     # 创建优化器
     print("\n创建优化器...")

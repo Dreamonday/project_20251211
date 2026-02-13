@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 基于预测数据的模型推理脚本
-版本: v0.1
-日期: 20260120133643
+版本: v0.3
+日期: 20260206122523
 
 功能：
 1. 加载训练好的模型
@@ -13,9 +13,21 @@
 5. 整合历史误差指标
 6. 生成Excel和Parquet输出文件
 
+v0.3更新：
+- 添加对TimeXer-Official v0.6模型的支持
+- 支持官方TimeXer架构（Patch-Level内生 + Variate-Level外生 + Global Token）
+- 支持单一内生变量（endogenous_index配置）
+- 支持patch_len=25的分块处理
+
+v0.2更新：
+- 添加对TimeXer v0.44（对数变换 + Huber Loss）的支持
+- v0.44使用与v0.43相同的模型架构，但训练时采用对数空间
+- 从checkpoint读取log_offset并自动进行对数反变换
+- 反变换公式：predicted_price = exp(predicted_log) - log_offset
+
 使用方法：
     修改代码配置区域，设置模型目录、预测数据文件和误差排名文件路径
-    然后运行: python predict_with_predata_v0.1_20260120133643.py
+    然后运行: python predict_with_predata_v0.3_20260206122523.py
 """
 
 import torch
@@ -47,13 +59,13 @@ sys.path.insert(0, str(project_root))
 
 # ===== 配置区域（修改此处） =====
 # 模型目录
-MODEL_DIR = "/data/project_20251211/experiments/timexer_v0.43_20260127120833_20260119170929_500120"
+MODEL_DIR = "/data/project_20251211/experiments/timexer_v0.6_20260207215300_preprocess_data_v1.0_20260119170929_500120"
 
 # 预测数据文件（.pt文件路径）
 PREDATA_FILE = "/data/project_20251211/data/pre_data/processed_data_20260118/data.pt"
 
-# 误差排名文件路径
-ERROR_RANKING_FILE = "/data/project_20251211/tests/inference_results/timexer_v0.43_20260127120833_20260119170929_500120_20260121134938/不同误差下的公司排名.parquet"
+# 误差排名文件路径（可选，如果不需要可以设为None或空字符串）
+ERROR_RANKING_FILE = "/data/project_20251211/tests/inference_results/timexer_v0.6_20260207215300_preprocess_data_v1.0_20260119170929_500120_20260207224145/不同误差下的公司排名.parquet"
 
 # 输出目录
 OUTPUT_DIR = "/data/project_20251211/tests/pre_data"
@@ -96,13 +108,20 @@ def detect_model_type(model_dir: Path) -> tuple:
     model_name = config.get('model', {}).get('name', '').lower()
     dir_name = model_dir.name.lower()
     
+    # v0.3新增：优先识别TimeXer-Official v0.6
+    if 'timexer_official' in model_name or 'timexer_official' in dir_name:
+        return 'timexer_official', 'v0.6_20260206'
+    
     # 优先从目录名精确识别TimeXer版本
     if 'timexer' in model_name or 'timexer' in dir_name:
         version_pattern = r'v0\.\d+_\d{8}'
         match = re.search(version_pattern, dir_name)
         if match:
             version_str = match.group(0)
-            if version_str.startswith('v0.43_'):
+            # v0.2新增：支持v0.44
+            if version_str.startswith('v0.44_'):
+                return 'timexer', 'v0.44_20260126'
+            elif version_str.startswith('v0.43_'):
                 return 'timexer', 'v0.43_20260119'
             elif version_str.startswith('v0.42_'):
                 return 'timexer', 'v0.42_20260118'
@@ -145,7 +164,7 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
         device: 计算设备
         
     Returns:
-        加载好的模型
+        (model, model_version, log_offset): 加载好的模型、模型版本和对数变换offset（如果有）
     """
     print(f"\n加载模型: {model_dir}")
     
@@ -167,8 +186,29 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # 根据模型类型加载对应的模型类
-    models_path = project_root / "src" / "models" / model_version
+    # v0.2新增：读取log_offset（v0.44模型需要）
+    log_offset = checkpoint.get('log_offset', None)
+    if log_offset is not None:
+        print(f"从checkpoint读取log_offset: {log_offset}")
+    
+    # ===== 智能版本检测：根据checkpoint中的参数特征判断实际模型版本 =====
+    checkpoint_keys = set(checkpoint['model_state_dict'].keys())
+    has_missing_embedding = any('missing_embedding' in key for key in checkpoint_keys)
+    
+    # 根据参数特征智能选择模型代码路径
+    if has_missing_embedding and model_type == 'timexer_mlp':
+        # 检测到missing_embedding，使用v0.51版本的模型定义
+        actual_model_version = 'v0.51_20260128'
+        models_path = project_root / "src" / "models" / actual_model_version
+        print(f"检测到missing_embedding参数，使用模型版本: {actual_model_version}")
+    elif model_version == 'v0.44_20260126':
+        # v0.44使用与v0.43相同的模型代码（只是训练方式不同）
+        models_path = project_root / "src" / "models" / "v0.43_20260119"
+    elif model_type == 'timexer_official':
+        # v0.3新增：TimeXer-Official使用v0.6版本的模型代码
+        models_path = project_root / "src" / "models" / "v0.6_20260206"
+    else:
+        models_path = project_root / "src" / "models" / model_version
     
     if model_type == 'itransformer':
         itransformer_module = _load_module(models_path / "itransformer_decoder.py", "itransformer_decoder")
@@ -239,6 +279,27 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
             output_projection_config=model_config.get('output_projection', {})
         )
     
+    elif model_type == 'timexer_official':
+        # v0.3新增：TimeXer-Official v0.6（官方架构）
+        timexer_official_module = _load_module(models_path / "timexer_official_adapter.py", "timexer_official_adapter")
+        ModelClass = timexer_official_module.TimeXerOfficialAdapter
+        
+        model = ModelClass(
+            seq_len=model_config['seq_len'],
+            n_features=model_config['n_features'],
+            endogenous_index=model_config.get('endogenous_index', 1),
+            prediction_len=model_config.get('prediction_len', 1),
+            patch_len=model_config.get('patch_len', 25),
+            d_model=model_config.get('d_model', 64),
+            n_heads=model_config.get('n_heads', 8),
+            e_layers=model_config.get('e_layers', 2),
+            d_ff=model_config.get('d_ff', 256),
+            dropout=model_config.get('dropout', 0.1),
+            activation=model_config.get('activation', 'gelu'),
+            use_norm=model_config.get('use_norm', True),
+            missing_value_flag=model_config.get('missing_value_flag', -1000.0)
+        )
+    
     elif model_type == 'timexer':
         timexer_module = _load_module(models_path / "timexer.py", "timexer")
         ModelClass = timexer_module.TimeXer
@@ -270,8 +331,8 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
             'output_projection_config': model_config.get('output_projection', {})
         }
         
-        # v0.41及以上版本特有参数
-        if model_version in ['v0.41_20260116', 'v0.42_20260118', 'v0.43_20260119']:
+        # v0.41及以上版本特有参数（包括v0.44）
+        if model_version in ['v0.41_20260116', 'v0.42_20260118', 'v0.43_20260119', 'v0.44_20260126']:
             model_params['use_layernorm_in_tsmixer'] = model_config.get('use_layernorm_in_tsmixer')
             model_params['use_layernorm_in_attention'] = model_config.get('use_layernorm_in_attention')
             model_params['use_layernorm_before_pooling'] = model_config.get('use_layernorm_before_pooling')
@@ -299,15 +360,35 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
     else:
         raise ValueError(f"不支持的模型类型: {model_type}")
     
-    # 加载权重
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # ===== 弹性加载权重：允许参数不完全匹配 =====
+    # 使用strict=False允许checkpoint和模型定义之间有差异
+    missing_keys, unexpected_keys = model.load_state_dict(
+        checkpoint['model_state_dict'], 
+        strict=False
+    )
+    
+    # 记录加载详情
+    if missing_keys:
+        print(f"警告: 模型中缺失以下参数（checkpoint中没有）:")
+        for key in missing_keys:
+            print(f"  - {key}")
+    
+    if unexpected_keys:
+        print(f"警告: checkpoint中包含以下额外参数（模型中未使用）:")
+        for key in unexpected_keys:
+            print(f"  - {key}")
+    
+    if not missing_keys and not unexpected_keys:
+        print("✓ 所有参数完全匹配，加载成功")
+    
     model.to(device)
     model.eval()
     
     print(f"模型参数数量: {model.get_num_parameters():,}")
     print(f"模型加载完成，使用设备: {device}")
     
-    return model
+    # v0.2新增：返回模型版本和log_offset
+    return model, model_version, log_offset
 
 
 def load_predata(predata_file: Path):
@@ -378,6 +459,8 @@ def load_error_ranking(error_ranking_file: Path):
 
 def predict_and_merge(
     model: nn.Module,
+    model_version: str,
+    log_offset: float,
     predata: dict,
     error_ranking_df: pd.DataFrame = None,
     device: str = 'cuda',
@@ -388,6 +471,8 @@ def predict_and_merge(
     
     Args:
         model: 模型
+        model_version: 模型版本（用于判断是否需要对数还原）
+        log_offset: 对数变换的offset（v0.44模型需要）
         predata: 预测数据字典
         error_ranking_df: 误差排名DataFrame
         device: 计算设备
@@ -399,6 +484,13 @@ def predict_and_merge(
     print("\n" + "=" * 80)
     print("开始预测")
     print("=" * 80)
+    
+    # v0.2新增：判断是否需要对数还原（v0.44模型使用对数空间训练）
+    needs_log_inverse = (model_version == 'v0.44_20260126')
+    if needs_log_inverse:
+        if log_offset is None:
+            raise ValueError("v0.44模型需要log_offset进行还原，但未找到log_offset信息！")
+        print(f"\n*** 检测到v0.44模型，将使用 exp(pred) - {log_offset:.4f} 进行对数还原 ***")
     
     # 提取数据
     X = predata['X']
@@ -427,6 +519,11 @@ def predict_and_merge(
         for i in tqdm(range(0, len(X), batch_size), desc="预测进度"):
             batch_X = X[i:i+batch_size].to(device)
             batch_pred = model(batch_X)
+            
+            # v0.2新增：v0.44模型需要从对数空间还原：exp(pred) - log_offset
+            if needs_log_inverse:
+                batch_pred = torch.exp(batch_pred) - log_offset
+            
             predictions.extend(batch_pred.cpu().numpy().flatten().tolist())
     
     print(f"预测完成，共 {len(predictions)} 个样本")
@@ -450,7 +547,7 @@ def predict_and_merge(
         # 获取最后一天的收盘价（从原始数据）
         last_close_price = X[idx, -1, close_idx].item()
         
-        # 预测收盘价
+        # 预测收盘价（已经过对数还原处理，如果是v0.44模型）
         predicted_close_price = predictions[idx]
         
         # 计算收益率
@@ -587,7 +684,7 @@ def main():
     predata_name = predata_file.parent.name  # 使用文件夹名称
     
     print("=" * 80)
-    print("基于预测数据的模型推理脚本 v0.1")
+    print("基于预测数据的模型推理脚本 v0.3")
     print("=" * 80)
     print(f"模型目录: {model_dir}")
     print(f"预测数据文件: {predata_file}")
@@ -597,8 +694,8 @@ def main():
     print(f"批次大小: {BATCH_SIZE}")
     print("=" * 80)
     
-    # 加载模型
-    model = load_model_dynamically(model_dir, device=device)
+    # v0.2修改：加载模型（返回模型、版本信息和log_offset）
+    model, model_version, log_offset = load_model_dynamically(model_dir, device=device)
     
     # 加载预测数据
     predata = load_predata(predata_file)
@@ -608,9 +705,11 @@ def main():
     if error_ranking_file and error_ranking_file.exists():
         error_ranking_df = load_error_ranking(error_ranking_file)
     
-    # 预测并合并结果
+    # v0.2修改：预测并合并结果（传递模型版本信息和log_offset）
     results_df = predict_and_merge(
         model=model,
+        model_version=model_version,
+        log_offset=log_offset,
         predata=predata,
         error_ranking_df=error_ranking_df,
         device=device,

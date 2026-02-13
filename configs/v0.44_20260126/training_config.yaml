@@ -1,0 +1,117 @@
+# 训练配置文件（支持对数变换）
+# 版本: v0.44
+# 日期: 20260126
+
+metadata:
+  version: "v0.44"
+  date: "20260126"
+  description: "训练配置 - 对数变换 + Huber Loss应对大跨度预测"
+
+training:
+  # 基础训练参数
+  batch_size: 96          # 在48和128之间取平衡，避免显存OOM
+  num_epochs: 38
+  num_workers: 4          # 降低workers数量，避免内存OOM（从8降到4）
+  pin_memory: true
+  prefetch_factor: 2      # 降低预取数量，避免内存OOM（从6降到2）
+  persistent_workers: true # 保持worker进程，避免每个epoch重启
+  
+  # 优化器配置
+  optimizer:
+    type: "adamw"  # "adam", "adamw", "sgd"
+    lr: 1e-4       # 初始学习率
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+  
+  # 学习率调度器
+  scheduler:
+    type: "cosine"  # "cosine", "step", "plateau", "none"
+    T_max: 38       # Cosine退火的最大周期数
+    eta_min: 1e-6  # 最小学习率
+    step_size: 30   # StepLR的步长
+    gamma: 0.1      # StepLR的衰减率
+    factor: 0.5     # ReduceLROnPlateau的衰减因子
+    patience: 10    # ReduceLROnPlateau的耐心值
+  
+  # 损失函数（v0.44新版：使用Huber Loss，配合对数变换应对大跨度预测）
+  loss:
+    type: "huber"  # "mse", "mae", "huber"（推荐，对异常值鲁棒）
+    reduction: "mean"
+    delta: 0.5     # Huber Loss的delta参数（分界点），小于delta用MSE，大于delta用MAE
+    # 说明：
+    # - delta=1.0: 误差在[-1, 1]内用MSE（平滑），超出用MAE（线性），不会爆炸
+    # - 配合对数变换后，误差已经在合理范围内，不需要额外的clip
+  
+  # 验证和保存
+  val_interval: 1        # 每N个epoch验证一次
+  save_interval: 999999  # 每N个epoch保存一次模型（设置为很大值以禁用定期保存，只保存最佳模型）
+  save_best: true        # 是否保存最佳模型
+  best_metric: "loss"    # 选择最佳模型的评估指标（使用原始空间的MAPE，与v0.43一致）
+  best_metric_mode: "min"  # 指标优化方向（"min": 越小越好）
+  early_stopping:
+    enabled: true
+    patience: 10         # 早停耐心值
+    min_delta: 0.0001    # 最小改进阈值
+    metric: "loss"       # 早停监控的指标（使用原始空间的MAPE，与v0.43一致）
+    mode: "min"          # 指标优化方向（"min": 越小越好）
+  
+  # 评估指标配置
+  metrics:
+    max_relative_error: null  # MAPE的相对误差上限（null表示不进行clip）
+    epsilon: 0.01             # 防止除零的小值
+  
+  # 设备配置
+  device: "cuda"  # "cuda" 或 "cpu"
+  mixed_precision: false  # 禁用混合精度，避免数值不稳定
+
+# TensorBoard配置
+tensorboard:
+  enabled: true                  # 是否启用TensorBoard
+  log_dir: "tensorboard"         # TensorBoard日志目录（相对于实验目录）
+  log_interval: 50               # 每N个batch记录一次标量（loss等）
+  histogram_interval: 500        # 每N个batch记录一次参数/梯度直方图
+  log_histograms: true           # 是否记录参数和梯度的直方图
+  
+  # 记录内容说明（v0.44更新）：
+  # - Loss_Log_Space/train_batch: 每个batch的训练损失（对数空间）
+  # - Loss_Log_Space/train_epoch: 每个epoch的训练损失（对数空间）
+  # - Loss_Log_Space/val_epoch: 验证损失（对数空间）
+  # - Metrics_Original/train_*: 训练集指标（原始空间：mae, mse, rmse, mape, r2）
+  # - Metrics_Original/val_*: 验证集指标（原始空间：mae, mse, rmse, mape, r2）
+  # - Learning_Rate: 学习率变化
+  # - Parameters/*: 模型参数分布（直方图）
+  # - Gradients/*: 梯度分布（直方图）
+  # - Predictions/scatter_plot_original: 预测值vs真实值散点图（原始空间，每5个epoch）
+
+# v0.44版本变更（对数变换 + Huber Loss）：
+# 核心改进：应对不同公司股票价格大跨度问题（-10到+1000）
+#
+# 1. 对数变换：
+#    - 目标值进行对数变换：y_log = log(y + offset)
+#    - offset自动计算：abs(min(y)) + 1.0
+#    - 作用：将[-10, 1000]压缩到[0, 7]左右的对数空间
+#    - 好处：不同价格尺度的股票误差变得可比
+#
+# 2. Huber Loss：
+#    - 替代MAPE/SMAPE，在对数空间计算
+#    - delta=1.0：小误差用MSE（平滑），大误差用MAE（鲁棒）
+#    - 不需要max_relative_error：对数空间 + Huber已经足够稳定
+#
+# 3. 双空间评估：
+#    - 训练损失：对数空间MAE Loss（用于梯度更新）
+#    - 最佳模型选择：原始空间MAPE（与v0.43一致，便于对比）
+#    - 早停监控：原始空间MAPE（与v0.43一致）
+#    - 评估指标：原始价格空间（MAE, MSE, RMSE, MAPE, R²）（给用户看）
+#    - TensorBoard同时记录两个空间的指标
+#
+# 4. 使用方式：
+#    - 数据集配置中启用log_transform: true
+#    - PreprocessedStockDataset会在__getitem__时自动变换
+#    - Trainer会自动检测并在验证时反变换
+#    - 无需手动处理，一切自动完成
+#
+# 5. 优势：
+#    - 解决大跨度预测问题
+#    - 不同价格股票损失可比
+#    - 无需损失裁剪，数值稳定
+#    - 评估指标在原始空间，易于理解

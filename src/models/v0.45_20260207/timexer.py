@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-TimeXer 主模型（学习型Missing Embedding）
-版本: v0.43
-日期: 20260119
+TimeXer 主模型（学习型Missing Embedding + Instance Normalization）
+版本: v0.45
+日期: 20260207
 
 实现TimeXer模型，用于多变量时间序列预测
 采用双分支架构：内生分支 + 宏观分支，通过交叉注意力融合
 
-v0.43新增：学习型Missing Embedding
+v0.45新增：Instance Normalization + 反归一化（基于v0.43）
 关键改进：
-1. 在forward开头自动检测-1000标记的缺失值
-2. 将缺失值替换为可学习的embedding向量
-3. 避免极端数值污染网络，保持训练稳定
-4. 不需要修改数据预处理流程
+1. 学习型Missing Embedding（继承自v0.43）
+2. Instance Normalization：模型内部对输入进行归一化（每个样本独立）
+3. 反归一化：输出前将预测值还原到原始尺度
+4. 损失计算在原始尺度上进行，更符合业务含义
 """
 
 import torch
@@ -50,26 +50,29 @@ except Exception as e:
 
 class TimeXer(nn.Module):
     """
-    TimeXer模型（学习型Missing Embedding）
+    TimeXer模型（学习型Missing Embedding + Instance Normalization）
     
     用于多变量时间序列预测的深度神经网络
     采用双分支架构：内生分支处理公司内部数据，宏观分支处理宏观指标
     
     模型结构：
     1. 输入: (batch, seq_len, n_features) = (batch, 500, 64)，可能包含-1000标记的缺失值
-    2. **立即替换缺失值为可学习embedding**（v0.43核心改进）
-    3. 分离: 内生 [batch, 500, 44] + 宏观 [batch, 500, 20]
-    4. 共享时间混合层（处理500时间步）
-    5. 内生分支: 3个LightweightTSMixerBlock → 时间聚合 → [batch, 256]
-    6. 宏观分支: 2个LightweightTSMixerBlock → 时间聚合 → [batch, 256]
-    7. 交叉注意力融合层（3层）
-    8. 输出投影: 多层残差降维 → [batch, prediction_len]
+    2. **立即替换缺失值为可学习embedding**（v0.43）
+    3. **Instance Normalization**（v0.45新增）：对输入进行归一化
+    4. 分离: 内生 [batch, 500, 44] + 宏观 [batch, 500, 20]
+    5. 共享时间混合层（处理500时间步）
+    6. 内生分支: 3个LightweightTSMixerBlock → 时间聚合 → [batch, 256]
+    7. 宏观分支: 2个LightweightTSMixerBlock → 时间聚合 → [batch, 256]
+    8. 交叉注意力融合层（3层）
+    9. 输出投影: 多层残差降维 → [batch, prediction_len]
+    10. **反归一化**（v0.45新增）：将输出还原到原始尺度
     
-    v0.43新增：学习型Missing Embedding
-    - 自动检测输入中的-1000标记
-    - 替换为可学习的embedding向量（小值初始化）
-    - 在第一个线性层之前完成替换，确保数值稳定
-    - 不需要显式传入mask
+    v0.45新增：Instance Normalization + 反归一化（方案B：masked 位置不参与）
+    - 在处理缺失值后对输入进行Instance Normalization
+    - 均值和标准差仅基于有效位置（mask=True）计算，归一化仅作用于有效位置，masked 位置保持 missing_emb
+    - 保存均值和标准差用于反归一化
+    - 输出前使用索引2（"收盘"）的统计量进行反归一化
+    - 损失计算在原始尺度上进行
     """
     
     def __init__(
@@ -110,7 +113,11 @@ class TimeXer(nn.Module):
         ff_dim: int = None,  # 保留以兼容，但不使用
         norm_type: str = "layer",  # 保留以兼容
         temporal_aggregation_config: Optional[Dict] = None,
-        output_projection_config: Optional[Dict] = None
+        output_projection_config: Optional[Dict] = None,
+        # v0.45新增：Instance Normalization参数
+        use_norm: bool = True,  # 是否使用Instance Normalization
+        norm_feature_indices: Optional[List[int]] = None,  # 需要归一化的特征索引（None=全部）
+        output_feature_index: int = 2  # 输出对应的特征索引（用于反归一化）
     ):
         """
         初始化TimeXer模型
@@ -145,6 +152,9 @@ class TimeXer(nn.Module):
             norm_type: 归一化类型（保留以兼容）
             temporal_aggregation_config: 时间聚合配置（可选）
             output_projection_config: 输出投影配置（可选）
+            use_norm: 是否使用Instance Normalization（v0.45新增，默认True）
+            norm_feature_indices: 需要归一化的特征索引列表（None=全部特征，v0.45新增）
+            output_feature_index: 输出对应的特征索引，用于反归一化（默认2="收盘"，v0.45新增）
         """
         super(TimeXer, self).__init__()
         
@@ -218,7 +228,7 @@ class TimeXer(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {activation}")
         
-        # ========== v0.43新增：学习型Missing Embedding ==========
+        # ========== v0.43：学习型Missing Embedding ==========
         # 可学习的缺失值表示，初始化为小值（0.01量级）
         # 形状：(1, 1, n_features)，所有batch和时间步共享
         self.missing_embedding = nn.Parameter(
@@ -226,6 +236,27 @@ class TimeXer(nn.Module):
         )
         # 缺失值标记（用于检测）
         self.missing_value_flag = -1000.0
+        
+        # ========== v0.45新增：Instance Normalization 配置 ==========
+        self.use_norm = use_norm
+        self.output_feature_index = output_feature_index
+        
+        # 验证输出特征索引
+        assert 0 <= output_feature_index < n_features, \
+            f"output_feature_index ({output_feature_index}) 超出范围 [0, {n_features})"
+        
+        # 创建归一化特征掩码
+        if norm_feature_indices is not None:
+            # 只对指定索引的特征进行归一化
+            norm_mask = torch.zeros(n_features, dtype=torch.bool)
+            for idx in norm_feature_indices:
+                assert 0 <= idx < n_features, \
+                    f"norm_feature_indices中的索引 {idx} 超出范围 [0, {n_features})"
+                norm_mask[idx] = True
+            self.register_buffer('norm_mask', norm_mask)
+        else:
+            # 默认对所有特征归一化
+            self.register_buffer('norm_mask', torch.ones(n_features, dtype=torch.bool))
         
         # ========== 共享时间混合层 ==========
         # 统一使用48维（能被8整除，且d_k=6是偶数，符合RoPE要求）
@@ -385,26 +416,24 @@ class TimeXer(nn.Module):
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        前向传播（学习型Missing Embedding）
+        前向传播（学习型Missing Embedding + Instance Normalization）
         
         Args:
             x: 输入张量，形状为 (batch, seq_len, n_features)
                可能包含-1000标记的缺失值
-            mask: 掩码张量（可选，v0.43中不需要，保留以兼容）
+            mask: 掩码张量（可选，保留以兼容）
                   如果为None，自动从x中检测-1000
         
         Returns:
-            输出张量，形状为 (batch, prediction_len)
+            输出张量，形状为 (batch, prediction_len)，已反归一化到原始尺度
             
         注意：为了兼容训练脚本，当prediction_len=1时，输出形状为(batch, 1)
         
-        **重要**：缺失值处理必须在第一时间完成，在任何线性层之前！
+        **重要**：缺失值处理和归一化必须在第一时间完成，在任何线性层之前！
         """
         # x: (batch, seq_len, n_features) = (batch, 500, 64)
         
-        # ========== v0.43关键步骤：立即处理缺失值 ==========
-        # **必须在第一时间完成，在任何线性层或其他操作之前！**
-        
+        # ========== Step 1: 处理缺失值（必须在第一时间完成）==========
         # 自动检测-1000标记的缺失值（精确匹配）
         if mask is None:
             mask = (x != self.missing_value_flag)  # True=有效数据, False=缺失数据(-1000)
@@ -418,9 +447,51 @@ class TimeXer(nn.Module):
         x = torch.where(mask, x, missing_emb)
         
         # 现在x中不再有-1000，全是正常值范围的数据
-        # 后续所有层都看到的是干净的、数值稳定的输入
         
-        # ========== 分离内生和宏观特征 ==========
+        # ========== Step 2: v0.45新增 - Instance Normalization（可选，方案B：仅有效位置参与统计与归一化）==========
+        if self.use_norm:
+            B, T, F = x.shape
+            # 初始化：先复制原始数据
+            x_normed = x.clone()
+            # 初始化均值和标准差（所有特征）
+            means = torch.zeros(B, 1, F, device=x.device)
+            stdev = torch.ones(B, 1, F, device=x.device)
+            
+            # 只对指定特征进行归一化
+            norm_indices = self.norm_mask.nonzero(as_tuple=True)[0]
+            if len(norm_indices) > 0:
+                # 提取需要归一化的特征子集及对应 mask
+                x_norm_subset = x[:, :, norm_indices]  # [B, T, num_norm_features]
+                mask_subset = mask[:, :, norm_indices].float()  # [B, T, num_norm_features]，True=有效
+                
+                # 仅对有效位置（mask=True）计算均值和标准差（masked statistics）
+                count = mask_subset.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1, num_norm_features]
+                sum_x = (x_norm_subset * mask_subset).sum(dim=1, keepdim=True)
+                means_subset = (sum_x / count).detach()  # [B, 1, num_norm_features]
+                x_centered = x_norm_subset - means_subset
+                sum_sq = ((x_centered ** 2) * mask_subset).sum(dim=1, keepdim=True)
+                var_subset = sum_sq / count
+                stdev_subset = torch.sqrt(var_subset + 1e-5).detach()  # [B, 1, num_norm_features]
+                
+                # 方案B：仅对有效位置做归一化，masked 位置保持原值（missing_emb）
+                x_normed_subset = (x_norm_subset - means_subset) / stdev_subset
+                x_normed_subset = torch.where(
+                    mask_subset.to(torch.bool), x_normed_subset, x_norm_subset
+                )
+                
+                # 将归一化后的值写回
+                x_normed[:, :, norm_indices] = x_normed_subset
+                
+                # 保存均值和标准差（用于反归一化）
+                means[:, :, norm_indices] = means_subset
+                stdev[:, :, norm_indices] = stdev_subset
+            
+            x = x_normed
+        else:
+            means = None
+            stdev = None
+        
+        # ========== Step 3: 分离内生和宏观特征 ==========
         if self.use_indices:
             # 使用索引列表方式分离特征
             # register_buffer会自动处理设备移动，无需手动处理
@@ -545,6 +616,16 @@ class TimeXer(nn.Module):
         # 32 → prediction_len（直接线性变换，无激活函数，无残差模块）
         x = self.output_proj3(x)  # (batch, prediction_len)
         
+        # ========== Step 9: v0.45新增 - 反归一化（将输出还原到原始尺度）==========
+        if self.use_norm and means is not None:
+            # 使用输出特征索引对应的均值和标准差
+            output_mean = means[:, :, self.output_feature_index]  # [B, 1]
+            output_std = stdev[:, :, self.output_feature_index]   # [B, 1]
+            
+            # 反归一化: x_original = x_normalized * std + mean
+            # 广播: [B, 1] → [B, prediction_len]
+            x = x * output_std + output_mean
+        
         return x
     
     def get_num_parameters(self) -> int:
@@ -565,6 +646,9 @@ class TimeXer(nn.Module):
         Returns:
             包含模型详细信息的字典
         """
+        # 获取归一化特征索引
+        norm_indices = self.norm_mask.nonzero(as_tuple=True)[0].cpu().tolist()
+        
         return {
             'seq_len': self.seq_len,
             'n_features': self.n_features,
@@ -584,8 +668,13 @@ class TimeXer(nn.Module):
             'use_layernorm_before_pooling': self.use_layernorm_before_pooling,
             'use_residual': self.use_residual,
             'num_parameters': self.get_num_parameters(),
-            'missing_embedding_enabled': True,  # v0.43新增
-            'missing_value_flag': self.missing_value_flag,  # v0.43新增
+            'missing_embedding_enabled': True,  # v0.43
+            'missing_value_flag': self.missing_value_flag,  # v0.43
+            # v0.45新增信息
+            'use_norm': self.use_norm,
+            'norm_feature_indices': norm_indices,
+            'num_norm_features': len(norm_indices),
+            'output_feature_index': self.output_feature_index,
             'architecture': {
                 'shared_time_mixing': self.shared_time_mixing is not None,
                 'endogenous_branch': {

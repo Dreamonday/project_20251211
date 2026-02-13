@@ -1,11 +1,11 @@
-# TimeXer 模型配置文件（学习型Missing Embedding）
-# 版本: v0.43
-# 日期: 20260119
+# TimeXer 模型配置文件（学习型Missing Embedding + Instance Normalization）
+# 版本: v0.45
+# 日期: 20260207
 
 metadata:
-  version: "v0.43"
-  date: "20260119"
-  description: "TimeXer模型配置 - 双分支架构（内生+宏观），交叉注意力融合 - 支持细粒度LayerNorm控制 - 学习型Missing Embedding"
+  version: "v0.45"
+  date: "20260207"
+  description: "TimeXer模型配置 - 双分支架构（内生+宏观），交叉注意力融合 - 支持细粒度LayerNorm控制 - 学习型Missing Embedding + Instance Normalization"
 
 model:
   name: "timexer"
@@ -72,6 +72,15 @@ model:
   # 输出投影配置
   output_projection:
     hidden_dim: 20      # 输出投影层隐藏维度（保留以兼容，实际架构固定）
+  
+  # ========== v0.45新增：Instance Normalization配置 ==========
+  use_norm: true                    # 是否使用Instance Normalization
+  norm_feature_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+                        34, 35, 36, 37, 38, 39, 40, 41, 42, 43,44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]        # 需要归一化的特征索引列表
+                                    # - null: 归一化所有特征（推荐）
+                                    # - [0,1,2,...]: 只归一化指定索引的特征
+  output_feature_index: 2           # 输出对应的特征索引（用于反归一化）
+                                    # 索引2 = 第3个特征 = "收盘"价格
 
 # 架构说明：
 # - 双分支架构：内生分支处理公司内部数据（44维），宏观分支处理宏观指标（20维）
@@ -94,13 +103,14 @@ model:
 # - 将缺失值替换为可学习的embedding向量（小值初始化，0.01量级）
 # - 替换发生在第一个线性层之前，确保数值稳定
 # - 不需要修改数据预处理流程，原始.pt文件中的-1000直接使用
-# - 模型参数增加：(1, 1, 64)的missing_embedding参数
-# - 训练过程：
-#   * 前向传播：检测-1000 → 替换为embedding → 正常计算
-#   * 反向传播：梯度更新missing_embedding参数
-#   * 模型自动学习最优的"缺失"表示
+#
+# v0.45版本新增（Instance Normalization）：
+# - Instance Normalization：模型内部对输入进行归一化（每个样本独立）
+# - 反归一化：输出前将预测值还原到原始尺度
+# - 损失计算在原始尺度上进行，更符合业务含义
+# - 使用 output_feature_index（索引2="收盘"）进行反归一化
 # - 优势：
-#   * 数值稳定：避免-1000极端值污染网络
-#   * 语义明确：缺失值有独特的可学习表示
-#   * 无需显式mask：模型内部自动处理
-#   * 向后兼容：数据集返回的mask参数可选
+#   * 数值稳定：Instance Normalization 统一数据尺度
+#   * 损失合理：在原始尺度（股价）上计算损失
+#   * 业务可解释：预测输出直接是股价，无需后处理
+#   * 模型内自包含：归一化和反归一化都在模型内部完成

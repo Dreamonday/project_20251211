@@ -1,0 +1,84 @@
+# TimeXer-MLP 模型配置文件
+# 版本: v0.51
+# 日期: 20260128
+
+metadata:
+  version: "v0.51"
+  date: "20260128"
+  description: "TimeXer-MLP模型配置 - 双分支架构（内生+宏观），MLP融合，学习型Missing Embedding"
+
+model:
+  name: "timexer_mlp"
+  
+  # 输入输出维度（会自动根据实际数据调整，这里的值只是初始值）
+  seq_len: 500          # 输入序列长度（会自动检测并更新）
+  n_features: 64        # 总特征数量（会自动检测并更新，无需手动修改）
+  prediction_len: 1     # 预测长度（输出维度）
+  
+  # 特征分离方案选择
+  # 可选值: "default", "subset10", 或 "custom"
+  # - "default": 使用 preset_default 的索引配置
+  # - "subset10": 使用 preset_subset10 的索引配置
+  # - "custom": 使用 endogenous_indices 和 exogenous_indices 自定义索引
+  feature_split_preset: "subset10"
+  
+  # 预设方案配置（当 feature_split_preset 为 "default" 或 "subset10" 时使用）
+  preset_default:
+    endogenous_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43]  # 内生[0-43]共44个
+    exogenous_indices: [44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]  # 外生[44-63]共20个
+  
+  preset_subset10:
+    endogenous_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # 内生[1-10]共10个
+    exogenous_indices: [0, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]  # 外生[0,11-63]共54个
+  
+  # 自定义特征分离配置（当 feature_split_preset 为 "custom" 时使用）
+  endogenous_indices: null  # 设置为具体索引列表或 null
+  exogenous_indices: null   # 设置为具体索引列表或 null
+  
+  # 方式2: 使用特征数量（保留以兼容，模型会自动根据索引列表计算）
+  endogenous_features: 10    # 内生特征数量（由索引列表自动计算）
+  exogenous_features: 54     # 宏观特征数量（由索引列表自动计算）
+  
+  # 内生分支配置
+  endogenous_blocks: 3       # 内生分支TSMixer块数量
+  endogenous_hidden_dim: 256 # 内生分支隐藏维度
+  
+  # 宏观分支配置
+  exogenous_blocks: 2        # 宏观分支TSMixer块数量
+  exogenous_hidden_dim: 256  # 宏观分支隐藏维度
+  
+  # 共享时间混合配置
+  shared_time_mixing: true   # 是否共享时间混合层（MLP）
+  
+  # MLP融合配置（替代Attention）
+  mlp_fusion_ff_dim: 512     # MLP融合层FFN维度
+  
+  # 通用配置
+  dropout: 0.1          # Dropout比率
+  activation: "gelu"    # 激活函数: "gelu" 或 "relu"
+  norm_type: "layer"    # 归一化类型（保留以兼容）
+  use_layernorm: false  # 是否启用LayerNorm
+  use_residual: true    # 是否启用残差连接
+  
+  # 保留以兼容训练脚本的参数（不使用）
+  n_blocks: 3           # TSMixer块数量（保留以兼容，不使用）
+  ff_dim: 2048         # 前馈网络隐藏维度（保留以兼容，不使用）
+  
+  # 时间维度聚合配置
+  temporal_aggregation:
+    use_attention: false  # 使用简单平均池化
+  
+  # 输出投影配置
+  output_projection:
+    hidden_dim: 20      # 输出投影层隐藏维度（保留以兼容，实际架构固定）
+
+# 架构说明：
+# - 双分支架构：内生分支处理公司内部数据（44维），宏观分支处理宏观指标（20维）
+# - 共享时间混合层：两分支共享MLP时间混合块，减少参数量
+# - 内生分支：3个LightweightTSMixerBlock，hidden_dim=256
+# - 宏观分支：2个LightweightTSMixerBlock，hidden_dim=256
+# - MLP融合层：3层（交叉融合 → 自增强 → 交叉融合），完全替代Attention机制
+#   - 第一层：MLPCrossFusionLayer（内生×宏观）
+#   - 第二层：MLPSelfEnhancementLayer（自增强）
+#   - 第三层：MLPCrossFusionLayer（宏观×增强内生）
+# - 输出投影：256维残差 → 64维残差 → 32维残差 → prediction_len

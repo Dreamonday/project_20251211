@@ -1,0 +1,81 @@
+# 训练配置文件（TimeXer-Official适配器）
+# 版本: v0.6
+# 日期: 20260206
+
+metadata:
+  version: "v0.6"
+  date: "20260206"
+  description: "训练配置 - TimeXer-Official适配器 (集成TensorBoard可视化)"
+
+training:
+  # 基础训练参数
+  batch_size: 2048          # 在48和128之间取平衡，避免显存OOM
+  num_epochs: 15
+  num_workers: 15          # 启用8个进程并行加载数据，充分利用CPU内存
+  pin_memory: true
+  prefetch_factor: 6      # 每个worker预取6个batch，增加数据缓存
+  persistent_workers: true # 保持worker进程，避免每个epoch重启
+  
+  # 数据加载配置
+  data_loading:
+    mmap_mode: ture              # 是否使用内存映射（推荐true，大数据集必须开启，避免内存爆炸）
+    precompute_mask: true        # 是否预计算mask（仅mmap模式下有效，建议true以提升训练速度）
+    load_to_memory: true        # 是否全部加载到内存（仅在mmap_mode=false时有效）
+    blank_value: -1000.0             # 缺失值标记
+    return_mask: true            # 是否返回mask
+  
+  # 优化器配置
+  optimizer:
+    type: "adamw"  # "adam", "adamw", "sgd"
+    lr: 8e-5       # 初始学习率
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+  
+  # 学习率调度器
+  scheduler:
+    type: "cosine"  # "cosine", "step", "plateau", "none"
+    T_max: 15       # Cosine退火的最大周期数
+    eta_min: 1e-6  # 最小学习率
+    step_size: 30   # StepLR的步长
+    gamma: 0.1      # StepLR的衰减率
+    factor: 0.5     # ReduceLROnPlateau的衰减因子
+    patience: 10    # ReduceLROnPlateau的耐心值
+  
+  # 损失函数
+  loss:
+    type: "mse"  # "mse", "mae", "huber", "mape", "smape"
+    reduction: "mean"
+    # SMAPE/MAPE特有参数
+    epsilon: 0.01  # 防止除零的小值
+    max_relative_error: 2.0  # SMAPE裁剪相对误差上限
+  
+  # 验证和保存
+  val_interval: 1        # 每N个epoch验证一次
+  save_interval: 999999  # 每N个epoch保存一次模型（设置为很大值以禁用定期保存）
+  save_best: true        # 是否保存最佳模型
+  best_metric: "mape"    # 选择最佳模型的评估指标
+  best_metric_mode: "min"  # 指标优化方向
+  early_stopping:
+    enabled: false
+    patience: 20         # 早停耐心值
+    min_delta: 0.0001    # 最小改进阈值
+    metric: "loss"       # 早停监控的指标
+    mode: "min"          # 指标优化方向
+  
+  # 设备配置
+  device: "cuda"  # "cuda" 或 "cpu"
+  mixed_precision: false  # 禁用混合精度，避免数值不稳定
+
+# TensorBoard配置
+tensorboard:
+  enabled: true                  # 是否启用TensorBoard
+  log_dir: "tensorboard"         # TensorBoard日志目录（相对于实验目录）
+  log_interval: 50               # 每N个batch记录一次标量（loss等）
+  histogram_interval: 500        # 每N个batch记录一次参数/梯度直方图
+  log_histograms: true           # 是否记录参数和梯度的直方图
+
+# v0.6版本说明：
+# - 使用官方TimeXer架构（Patch-Level + Variate-Level + Global Token）
+# - 保留学习型Missing Embedding和数据流接口
+# - 训练参数与v0.43保持一致，确保公平对比
+# - 预期：官方架构可能在长期依赖建模上表现更好

@@ -15,14 +15,7 @@ model:
   n_features: 64        # 总特征数量（会自动检测并更新，无需手动修改）
   prediction_len: 1     # 预测长度（输出维度）
   
-  # 特征分离方案选择
-  # 可选值: "default" 或 "subset10"
-  # - "default": 内生[0-43]共44个，外生[44-63]共20个（原方案）
-  # - "subset10": 内生[1-10]共10个，外生[0,11-63]共54个（新方案）
-  feature_split_preset: "default"
-  
   # 特征分离配置（使用位置索引）
-  # 注意：以下索引列表会被 feature_split_preset 自动覆盖
   # 方式1: 使用索引列表（推荐，更灵活）
   endogenous_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43]  # 内生数据位置索引（共44个）
   exogenous_indices: [44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]  # 宏观数据位置索引（共20个）
@@ -50,7 +43,7 @@ model:
   cross_attn_ff_dim: 1024    # 交叉注意力FFN维度
   
   # 通用配置
-  dropout: 0.1               # Dropout比率
+  dropout: 0.2               # Dropout比率
   activation: "gelu"         # 激活函数: "gelu" 或 "relu"
   norm_type: "layer"         # 归一化类型（保留以兼容）
   use_residual: true         # 是否启用残差连接

@@ -10,7 +10,7 @@ metadata:
 training:
   # 基础训练参数
   batch_size: 96          # 在48和128之间取平衡，避免显存OOM
-  num_epochs: 50
+  num_epochs: 15
   num_workers: 8          # 启用8个进程并行加载数据，充分利用CPU内存
   pin_memory: true
   prefetch_factor: 6      # 每个worker预取6个batch，增加数据缓存
@@ -19,15 +19,15 @@ training:
   # 优化器配置
   optimizer:
     type: "adamw"  # "adam", "adamw", "sgd"
-    lr: 1e-4       # 初始学习率
+    lr: 7e-5       # 初始学习率
     weight_decay: 0.05
     betas: [0.9, 0.999]
   
   # 学习率调度器
   scheduler:
     type: "cosine"  # "cosine", "step", "plateau", "none"
-    T_max: 50       # Cosine退火的最大周期数
-    eta_min: 1e-6  # 最小学习率
+    T_max: 15       # Cosine退火的最大周期数
+    eta_min: 1e-7  # 最小学习率
     step_size: 30   # StepLR的步长
     gamma: 0.1      # StepLR的衰减率
     factor: 0.5     # ReduceLROnPlateau的衰减因子
@@ -46,7 +46,7 @@ training:
   val_interval: 1        # 每N个epoch验证一次
   save_interval: 999999  # 每N个epoch保存一次模型（设置为很大值以禁用定期保存，只保存最佳模型）
   save_best: true        # 是否保存最佳模型
-  best_metric: "loss"    # 选择最佳模型的评估指标（可选: "loss", "mape", "mae", "mse", "rmse", "r2"）
+  best_metric: "mape"    # 选择最佳模型的评估指标（可选: "loss", "mape", "mae", "mse", "rmse", "r2"）
   best_metric_mode: "min"  # 指标优化方向（"min": 越小越好, "max": 越大越好）
   early_stopping:
     enabled: true

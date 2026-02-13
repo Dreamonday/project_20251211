@@ -2,13 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 主训练脚本（集成TensorBoard）- TimeXer版本（双分支架构）
-版本: v0.43
-日期: 20260119
+版本: v0.44
+日期: 20260126
 
 整合所有模块，作为训练入口，支持TensorBoard可视化
 使用TimeXer双分支模型进行时间序列预测（内生+宏观，交叉注意力融合）
 
-v0.43新增：学习型Missing Embedding，在模型内部自动处理-1000缺失值
+v0.44新增：
+- 对数变换：应对大跨度价格预测问题
+- Huber Loss：替代MAPE/SMAPE
+- 双空间评估：训练在对数空间，评估在原始空间
 """
 
 import torch
@@ -52,10 +55,10 @@ def _load_module(module_path: Path, module_name: str):
     spec.loader.exec_module(module)
     return module
 
-# 导入所需模块（使用v0.43_20260119版本的模型，v0.3_20260118版本的trainer，v0.3_20260119版本的数据(支持mmap)，v0.1版本的utils）
+# 导入所需模块（使用v0.43_20260119版本的模型，v0.4_20260126版本的trainer，v0.4_20260126版本的数据(支持对数变换)，v0.1版本的utils）
 models_path = project_root / "src" / "models" / "v0.43_20260119"
-data_path = project_root / "src" / "data" / "v0.3_20260119"
-training_path = project_root / "src" / "training" / "v0.3_20260118"
+data_path = project_root / "src" / "data" / "v0.4_20260126"
+training_path = project_root / "src" / "training" / "v0.4_20260126"
 utils_path = project_root / "src" / "utils" / "v0.1_20251212"
 
 # 导入模型
@@ -138,38 +141,6 @@ def create_scheduler(optimizer: torch.optim.Optimizer, scheduler_config: dict, n
         return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=factor, patience=patience)
     else:
         raise ValueError(f"Unknown scheduler type: {sched_type}")
-
-
-def get_feature_split_indices(preset: str, n_features: int) -> tuple:
-    """
-    根据预设方案返回内生和外生索引
-    
-    Args:
-        preset: 预设方案名称 ("default" 或 "subset10")
-        n_features: 总特征数量
-        
-    Returns:
-        (endogenous_indices, exogenous_indices): 内生和外生索引列表
-        
-    Raises:
-        ValueError: 如果预设方案未知
-    """
-    if preset == "default":
-        # 方案1: 内生[0-43]，外生[44-63]
-        endogenous_indices = list(range(0, 44))
-        exogenous_indices = list(range(44, 64))
-    elif preset == "subset10":
-        # 方案2: 内生[1-10]，外生[0,11-63]
-        endogenous_indices = list(range(1, 11))  # [1,2,3,4,5,6,7,8,9,10]
-        exogenous_indices = [0] + list(range(11, 64))  # [0,11,12,...,63]
-    else:
-        raise ValueError(f"Unknown feature_split_preset: {preset}. Available: 'default', 'subset10'")
-    
-    print(f"\n应用特征分离预设方案: '{preset}'")
-    print(f"  内生索引: {endogenous_indices[:5]}...{endogenous_indices[-5:]} (共{len(endogenous_indices)}个)")
-    print(f"  外生索引: {exogenous_indices[:5]}...{exogenous_indices[-5:]} (共{len(exogenous_indices)}个)")
-    
-    return endogenous_indices, exogenous_indices
 
 
 def create_criterion(loss_config: dict) -> nn.Module:
@@ -448,7 +419,7 @@ def get_data_generation_time(preprocessed_dir: Path = None, dataset_config: dict
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='训练TimeXer模型（双分支架构，交叉注意力融合，集成TensorBoard，学习型Missing Embedding）')
-    parser.add_argument('--config_version', type=str, default='v0.43_20260119',
+    parser.add_argument('--config_version', type=str, default='v0.44_20260126',
                         help='配置版本号')
     parser.add_argument('--model_config', type=str, default=None,
                         help='模型配置文件路径（可选，默认使用config_version）')
@@ -501,7 +472,7 @@ def main():
         dataset_config_path = str(fallback_config_dir / "dataset_config.yaml")
     
     print("=" * 80)
-    print("TimeXer 训练脚本 v0.43 (双分支 + 交叉注意力 + TensorBoard + 学习型Missing Embedding)")
+    print("TimeXer 训练脚本 v0.44 (双分支 + 交叉注意力 + TensorBoard + 对数变换)")
     print("=" * 80)
     print(f"模型配置: {model_config_path}")
     print(f"训练配置: {training_config_path}")
@@ -566,10 +537,11 @@ def main():
         print("\n自动检测预处理文件...")
         train_pt_file, val_pt_file = find_preprocessed_files(preprocessed_dir)
         
-        # 加载预处理数据集（v0.3支持mask + 内存映射）
+        # 加载预处理数据集（v0.4支持mask + 内存映射 + 对数变换）
         # 使用内存映射模式避免OOM，预计算mask充分利用CPU内存
         print("  使用内存映射模式加载（数据保留在磁盘，按需加载到内存）")
         print("  启用预计算mask（一次性生成所有mask，充分利用CPU内存）")
+        print("  启用对数变换（应对大跨度价格预测问题）")
         train_dataset = PreprocessedStockDataset(
             pt_file_path=str(train_pt_file),
             load_to_memory=False,  # mmap模式下忽略
@@ -577,7 +549,10 @@ def main():
             blank_value=-1000.0,  # 空白数据标记值
             return_mask=True,  # 启用mask
             mmap_mode=True,  # 启用内存映射（关键！）
-            precompute_mask=True  # 预计算mask，提升训练速度，充分利用CPU内存
+            precompute_mask=False,  # 关闭预计算mask，避免OOM（节省~7GB内存）
+            log_transform=True,  # v0.44新增：启用对数变换
+            log_offset=None,  # 自动计算offset
+            log_margin=1.0  # offset计算边距
         )
         
         val_dataset = PreprocessedStockDataset(
@@ -587,7 +562,10 @@ def main():
             blank_value=-1000.0,
             return_mask=True,
             mmap_mode=True,  # 启用内存映射
-            precompute_mask=True  # 预计算mask
+            precompute_mask=False,  # 关闭预计算mask，避免OOM（节省~7GB内存）
+            log_transform=True,  # v0.44新增：启用对数变换
+            log_offset=train_dataset.log_offset,  # 使用与训练集相同的offset
+            log_margin=1.0
         )
         
         # 从元数据中获取特征统计量
@@ -735,28 +713,19 @@ def main():
     # 初始化模型（使用更新后的配置）
     print("\n初始化TimeXer模型（v0.43，学习型Missing Embedding）...")
     
-    # 应用特征分离预设方案（如果配置中指定了）
-    preset = model_cfg.get('feature_split_preset', None)
-    if preset is not None:
-        # 根据预设方案生成索引列表，覆盖配置中的索引
-        endogenous_indices, exogenous_indices = get_feature_split_indices(preset, num_features)
-        # 更新配置
-        model_cfg['endogenous_indices'] = endogenous_indices
-        model_cfg['exogenous_indices'] = exogenous_indices
+    # 读取特征分离配置（优先使用索引列表）
+    endogenous_indices = model_cfg.get('endogenous_indices', None)
+    exogenous_indices = model_cfg.get('exogenous_indices', None)
+    
+    # 如果提供了索引列表，打印信息
+    if endogenous_indices is not None and exogenous_indices is not None:
+        print(f"使用索引列表方式分离特征:")
+        print(f"  内生数据位置索引: {endogenous_indices[:5]}...{endogenous_indices[-5:]} (共{len(endogenous_indices)}个)")
+        print(f"  宏观数据位置索引: {exogenous_indices[:5]}...{exogenous_indices[-5:]} (共{len(exogenous_indices)}个)")
     else:
-        # 读取配置中的索引列表
-        endogenous_indices = model_cfg.get('endogenous_indices', None)
-        exogenous_indices = model_cfg.get('exogenous_indices', None)
-        
-        # 如果提供了索引列表，打印信息
-        if endogenous_indices is not None and exogenous_indices is not None:
-            print(f"\n使用索引列表方式分离特征:")
-            print(f"  内生数据位置索引: {endogenous_indices[:5]}...{endogenous_indices[-5:]} (共{len(endogenous_indices)}个)")
-            print(f"  宏观数据位置索引: {exogenous_indices[:5]}...{exogenous_indices[-5:]} (共{len(exogenous_indices)}个)")
-        else:
-            print(f"\n使用特征数量方式分离特征:")
-            print(f"  内生特征数量: {model_cfg.get('endogenous_features', 44)}")
-            print(f"  宏观特征数量: {model_cfg.get('exogenous_features', 20)}")
+        print(f"使用特征数量方式分离特征:")
+        print(f"  内生特征数量: {model_cfg.get('endogenous_features', 44)}")
+        print(f"  宏观特征数量: {model_cfg.get('exogenous_features', 20)}")
     
     model = TimeXer(
         seq_len=model_cfg['seq_len'],  # 使用自动检测的序列长度
@@ -839,6 +808,11 @@ def main():
     best_metric_mode = train_cfg.get('best_metric_mode', 'min')
     print(f"最佳模型选择指标: {best_metric} ({best_metric_mode})")
     
+    # 获取评估指标配置
+    metrics_cfg = train_cfg.get('metrics', {})
+    max_relative_error = metrics_cfg.get('max_relative_error', None)
+    epsilon = metrics_cfg.get('epsilon', 1e-8)
+    
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -862,7 +836,10 @@ def main():
         tensorboard_dir=str(tensorboard_dir) if tensorboard_dir else None,
         tb_log_interval=tb_config.get('log_interval', 50),
         tb_histogram_interval=tb_config.get('histogram_interval', 500),
-        tb_log_histograms=tb_config.get('log_histograms', True)
+        tb_log_histograms=tb_config.get('log_histograms', True),
+        # 评估指标参数
+        max_relative_error=max_relative_error,
+        epsilon=epsilon
     )
     
     # 保存配置到configs子目录

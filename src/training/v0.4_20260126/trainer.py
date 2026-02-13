@@ -1,14 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-训练器类（集成TensorBoard，支持mask）
-版本: v0.3
-日期: 20260118
+训练器类（集成TensorBoard，支持mask + 对数变换）
+版本: v0.4
+日期: 20260126
 
 封装训练循环、验证、模型保存、TensorBoard可视化等功能
 适用于TSMixer、TimeXer等各种模型
 
-v0.3新增：支持mask传递，兼容带mask和不带mask的数据集
+v0.4新增：
+- 支持对数变换：训练在对数空间，评估在原始空间
+- 自动检测dataset的对数变换配置
+- 分别计算对数空间损失和原始空间指标
+- 对数空间损失用于训练和early stopping
+- 原始空间指标用于展示和TensorBoard记录
 """
 
 import torch
@@ -95,10 +100,11 @@ class EarlyStopping:
 
 class Trainer:
     """
-    训练器类（集成TensorBoard，支持mask）
+    训练器类（集成TensorBoard，支持mask + 对数变换）
     封装训练循环、验证、模型保存、TensorBoard可视化等功能
     
     v0.3新增：支持mask机制，兼容v0.1和v0.2数据集
+    v0.4新增：支持对数变换，训练在对数空间，评估在原始空间
     """
     
     def __init__(
@@ -125,7 +131,10 @@ class Trainer:
         tensorboard_dir: Optional[str] = None,
         tb_log_interval: int = 50,
         tb_histogram_interval: int = 500,
-        tb_log_histograms: bool = True
+        tb_log_histograms: bool = True,
+        # 评估指标相关参数
+        max_relative_error: Optional[float] = None,
+        epsilon: float = 1e-8
     ):
         """
         初始化训练器
@@ -153,6 +162,8 @@ class Trainer:
             tb_log_interval: 每N个batch记录一次标量到TensorBoard
             tb_histogram_interval: 每N个batch记录一次直方图到TensorBoard
             tb_log_histograms: 是否记录参数和梯度直方图
+            max_relative_error: MAPE计算时的相对误差上限（可选，避免接近0的样本使MAPE爆炸）
+            epsilon: 防止除零的小值（用于MAPE计算）
         """
         self.model = model
         self.train_loader = train_loader
@@ -171,6 +182,10 @@ class Trainer:
         self.save_interval = save_interval
         self.log_file = log_file
         self.history_file = history_file
+        
+        # 评估指标配置
+        self.max_relative_error = max_relative_error
+        self.epsilon = epsilon
         
         # TensorBoard配置
         self.tensorboard_enabled = tensorboard_enabled
@@ -196,16 +211,30 @@ class Trainer:
         # 将模型移到设备
         self.model.to(self.device)
         
+        # v0.4新增：检测数据集是否启用了对数变换
+        self.log_transform_enabled = False
+        self.log_offset = None
+        
+        # 尝试从train_loader的dataset获取对数变换信息
+        if hasattr(train_loader.dataset, 'log_transform'):
+            self.log_transform_enabled = train_loader.dataset.log_transform
+            if self.log_transform_enabled:
+                self.log_offset = train_loader.dataset.log_offset
+                print(f"\n检测到对数变换已启用:")
+                print(f"  offset = {self.log_offset:.4f}")
+                print(f"  训练损失将在对数空间计算")
+                print(f"  评估指标将在原始空间计算（还原后）")
+        
         # 训练历史
         self.train_history = {
-            "loss": [],
-            "val_loss": [],
-            "metrics": [],
-            "val_metrics": [],
+            "loss": [],  # 对数空间的损失（用于训练）
+            "val_loss": [],  # 对数空间的损失（用于early stopping）
+            "metrics": [],  # 原始空间的评估指标（用于展示）
+            "val_metrics": [],  # 原始空间的评估指标（用于展示）
             "learning_rate": []
         }
         
-        # 最佳模型指标
+        # 最佳模型指标（基于对数空间的loss）
         if self.best_metric_mode == "min":
             self.best_val_metric = float('inf')
         else:
@@ -215,15 +244,32 @@ class Trainer:
         # 全局步数（用于TensorBoard）
         self.global_step = 0
     
+    def _inverse_transform(self, y_log: torch.Tensor) -> torch.Tensor:
+        """
+        对数变换的反变换
+        
+        Args:
+            y_log: 对数空间的值
+        
+        Returns:
+            原始空间的值
+        """
+        if not self.log_transform_enabled:
+            return y_log
+        
+        return torch.exp(y_log) - self.log_offset
+    
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
-        训练一个epoch（支持mask）
+        训练一个epoch（支持mask + 对数变换）
         
         Args:
             epoch: 当前epoch编号
         
         Returns:
-            训练指标字典（包含所有样本级平均的指标）
+            指标字典，包含：
+            - loss: 对数空间的损失（用于训练）
+            - metrics（原始空间）: mae, mse, rmse, mape, r2
         """
         self.model.train()
         total_loss = 0.0
@@ -234,15 +280,15 @@ class Trainer:
         print_interval = max(1, total_batches // 100)  # 每1%打印一次进度
         
         for batch_idx, batch_data in enumerate(self.train_loader):
-            # v0.3新增：检测数据格式
+            # 检测数据格式
             if len(batch_data) == 3:
-                # 支持mask的数据集（v0.2）
+                # 支持mask的数据集
                 X, y, mask = batch_data
                 X = X.to(self.device)
-                y = y.to(self.device)
+                y = y.to(self.device)  # 这里的y已经是对数空间（如果启用了变换）
                 mask = mask.to(self.device)
             else:
-                # 不支持mask的数据集（v0.1，向后兼容）
+                # 不支持mask的数据集
                 X, y = batch_data
                 X = X.to(self.device)
                 y = y.to(self.device)
@@ -270,6 +316,7 @@ class Trainer:
             if self.mixed_precision:
                 with torch.amp.autocast('cuda'):
                     pred = self.model(X, mask=mask) if mask is not None else self.model(X)
+                    # 损失在对数空间计算
                     loss = self.criterion(pred, y)
                 
                 # 检查模型输出和loss
@@ -295,6 +342,7 @@ class Trainer:
                 self.scaler.update()
             else:
                 pred = self.model(X, mask=mask) if mask is not None else self.model(X)
+                # 损失在对数空间计算
                 loss = self.criterion(pred, y)
                 
                 # 检查模型输出和loss
@@ -324,13 +372,13 @@ class Trainer:
             else:
                 print(f"\n警告: Batch {batch_idx + 1} Loss为NaN或Inf，跳过记录")
             
-            # 收集预测和目标（用于计算样本级指标）
+            # 收集预测和目标（对数空间）
             all_preds.append(pred.detach().cpu())
             all_targets.append(y.detach().cpu())
             
             # ===== TensorBoard: 记录训练loss（每N个batch） =====
             if self.writer and (self.global_step % self.tb_log_interval == 0):
-                self.writer.add_scalar('Loss/train_batch', loss_value, self.global_step)
+                self.writer.add_scalar('Loss_Log_Space/train_batch', loss_value, self.global_step)
             
             # ===== TensorBoard: 记录参数和梯度直方图（每M个batch） =====
             if self.writer and self.tb_log_histograms and (self.global_step % self.tb_histogram_interval == 0):
@@ -344,55 +392,84 @@ class Trainer:
             
             self.global_step += 1
             
-            # 打印进度（显示criterion的loss）
+            # 打印进度（显示对数空间的loss）
             if (batch_idx + 1) % print_interval == 0 or (batch_idx + 1) == total_batches:
                 progress = (batch_idx + 1) / total_batches * 100
                 loss_display = loss_value if not (math.isnan(loss_value) or math.isinf(loss_value)) else float('nan')
+                space_name = "对数空间" if self.log_transform_enabled else "原始空间"
                 print(f"\r训练进度: [{batch_idx + 1}/{total_batches}] ({progress:.1f}%) | "
-                      f"Criterion Loss: {loss_display:.6f}", end="", flush=True)
+                      f"Loss ({space_name}): {loss_display:.6f}", end="", flush=True)
         
         # 训练完成后换行
         print()
         
-        # 拼接所有预测值和真实值，计算样本级平均指标
-        all_preds = torch.cat(all_preds, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
+        # 拼接所有预测值和真实值（对数空间）
+        all_preds_log = torch.cat(all_preds, dim=0)
+        all_targets_log = torch.cat(all_targets, dim=0)
         
-        # 计算criterion的样本级平均loss（作为主要指标）
-        criterion_loss = self.criterion(all_preds, all_targets).item()
+        # 计算对数空间的损失（用于训练和early stopping）
+        criterion_loss_log = self.criterion(all_preds_log, all_targets_log).item()
         
-        # 计算所有评估指标（样本级平均）
-        # 如果criterion是MAPELoss且设置了max_relative_error和epsilon，传递给metrics计算
-        max_relative_error = None
-        epsilon = 1e-8  # 默认值
-        if hasattr(self.criterion, 'max_relative_error'):
-            max_relative_error = self.criterion.max_relative_error
-        if hasattr(self.criterion, 'epsilon'):
-            epsilon = self.criterion.epsilon
-        metrics = compute_metrics(all_targets.numpy(), all_preds.numpy(), 
-                                  max_relative_error=max_relative_error, epsilon=epsilon)
+        # v0.4新增：反变换到原始空间并计算评估指标
+        if self.log_transform_enabled:
+            # 反变换
+            all_preds_original = self._inverse_transform(all_preds_log)
+            all_targets_original = self._inverse_transform(all_targets_log)
+            
+            # 计算原始空间的评估指标
+            metrics_original = compute_metrics(
+                all_targets_original.numpy(), 
+                all_preds_original.numpy(),
+                max_relative_error=self.max_relative_error,
+                epsilon=self.epsilon
+            )
+            
+            print(f"  训练集 - 对数空间损失: {criterion_loss_log:.6f}")
+            print(f"  训练集 - 原始空间指标: MAE={metrics_original['mae']:.4f}, "
+                  f"MSE={metrics_original['mse']:.2f}, "
+                  f"RMSE={metrics_original['rmse']:.4f}, "
+                  f"MAPE={metrics_original['mape']:.2f}%")
+        else:
+            # 如果没有对数变换，直接计算
+            # 优先使用传入的参数，其次从criterion读取
+            max_relative_error = self.max_relative_error
+            epsilon = self.epsilon
+            if max_relative_error is None and hasattr(self.criterion, 'max_relative_error'):
+                max_relative_error = self.criterion.max_relative_error
+            if hasattr(self.criterion, 'epsilon'):
+                epsilon = self.criterion.epsilon
+            metrics_original = compute_metrics(
+                all_targets_log.numpy(), 
+                all_preds_log.numpy(), 
+                max_relative_error=max_relative_error, 
+                epsilon=epsilon
+            )
         
         # ===== TensorBoard: 记录epoch级别的训练指标 =====
         if self.writer:
-            self.writer.add_scalar('Loss/train_epoch', criterion_loss, epoch)
-            for metric_name, metric_value in metrics.items():
-                self.writer.add_scalar(f'Metrics/train_{metric_name}', metric_value, epoch)
+            # 对数空间损失
+            self.writer.add_scalar('Loss_Log_Space/train_epoch', criterion_loss_log, epoch)
+            # 原始空间指标
+            for metric_name, metric_value in metrics_original.items():
+                self.writer.add_scalar(f'Metrics_Original/train_{metric_name}', metric_value, epoch)
         
-        # 返回所有指标，包含criterion的loss
+        # 返回指标
         return {
-            "loss": criterion_loss,  # 使用配置文件中指定的损失函数
-            **metrics
+            "loss": criterion_loss_log,  # 对数空间的损失（用于训练）
+            **metrics_original  # 原始空间的指标（用于展示）
         }
     
     def validate_epoch(self, epoch: int) -> Dict[str, float]:
         """
-        验证一个epoch（支持mask）
+        验证一个epoch（支持mask + 对数变换）
         
         Args:
             epoch: 当前epoch编号
         
         Returns:
-            验证指标字典（包含所有样本级平均的指标）
+            指标字典，包含：
+            - loss: 对数空间的损失（用于early stopping）
+            - metrics（原始空间）: mae, mse, rmse, mape, r2
         """
         self.model.eval()
         total_loss = 0.0
@@ -404,15 +481,15 @@ class Trainer:
         
         with torch.no_grad():
             for batch_idx, batch_data in enumerate(self.val_loader):
-                # v0.3新增：检测数据格式
+                # 检测数据格式
                 if len(batch_data) == 3:
-                    # 支持mask的数据集（v0.2）
+                    # 支持mask的数据集
                     X, y, mask = batch_data
                     X = X.to(self.device)
-                    y = y.to(self.device)
+                    y = y.to(self.device)  # 这里的y已经是对数空间（如果启用了变换）
                     mask = mask.to(self.device)
                 else:
-                    # 不支持mask的数据集（v0.1，向后兼容）
+                    # 不支持mask的数据集
                     X, y = batch_data
                     X = X.to(self.device)
                     y = y.to(self.device)
@@ -422,59 +499,94 @@ class Trainer:
                 if self.mixed_precision:
                     with torch.amp.autocast('cuda'):
                         pred = self.model(X, mask=mask) if mask is not None else self.model(X)
+                        # 损失在对数空间计算
                         loss = self.criterion(pred, y)
                 else:
                     pred = self.model(X, mask=mask) if mask is not None else self.model(X)
+                    # 损失在对数空间计算
                     loss = self.criterion(pred, y)
                 
                 # 记录损失（用于实时进度显示）
                 loss_value = loss.item()
                 total_loss += loss_value
                 
-                # 收集预测和目标（用于计算样本级指标）
+                # 收集预测和目标（对数空间）
                 all_preds.append(pred.cpu())
                 all_targets.append(y.cpu())
                 
-                # 打印验证进度（显示criterion的loss）
+                # 打印验证进度（显示对数空间的loss）
                 if (batch_idx + 1) % print_interval == 0 or (batch_idx + 1) == total_batches:
                     progress = (batch_idx + 1) / total_batches * 100
+                    space_name = "对数空间" if self.log_transform_enabled else "原始空间"
                     print(f"\r验证进度: [{batch_idx + 1}/{total_batches}] ({progress:.1f}%) | "
-                          f"Criterion Loss: {loss_value:.6f}", end="", flush=True)
+                          f"Loss ({space_name}): {loss_value:.6f}", end="", flush=True)
         
         # 验证完成后换行
         print()
         
-        # 拼接所有预测值和真实值，计算样本级平均指标
-        all_preds = torch.cat(all_preds, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
+        # 拼接所有预测值和真实值（对数空间）
+        all_preds_log = torch.cat(all_preds, dim=0)
+        all_targets_log = torch.cat(all_targets, dim=0)
         
-        # 计算criterion的样本级平均loss（作为主要指标）
-        criterion_loss = self.criterion(all_preds, all_targets).item()
+        # 计算对数空间的损失（用于early stopping）
+        criterion_loss_log = self.criterion(all_preds_log, all_targets_log).item()
         
-        # 计算所有评估指标（样本级平均）
-        # 如果criterion是MAPELoss且设置了max_relative_error和epsilon，传递给metrics计算
-        max_relative_error = None
-        epsilon = 1e-8  # 默认值
-        if hasattr(self.criterion, 'max_relative_error'):
-            max_relative_error = self.criterion.max_relative_error
-        if hasattr(self.criterion, 'epsilon'):
-            epsilon = self.criterion.epsilon
-        metrics = compute_metrics(all_targets.numpy(), all_preds.numpy(), 
-                                  max_relative_error=max_relative_error, epsilon=epsilon)
+        # v0.4新增：反变换到原始空间并计算评估指标
+        if self.log_transform_enabled:
+            # 反变换
+            all_preds_original = self._inverse_transform(all_preds_log)
+            all_targets_original = self._inverse_transform(all_targets_log)
+            
+            # 计算原始空间的评估指标
+            metrics_original = compute_metrics(
+                all_targets_original.numpy(), 
+                all_preds_original.numpy(),
+                max_relative_error=self.max_relative_error,
+                epsilon=self.epsilon
+            )
+            
+            print(f"  验证集 - 对数空间损失: {criterion_loss_log:.6f}")
+            print(f"  验证集 - 原始空间指标: MAE={metrics_original['mae']:.4f}, "
+                  f"MSE={metrics_original['mse']:.2f}, "
+                  f"RMSE={metrics_original['rmse']:.4f}, "
+                  f"MAPE={metrics_original['mape']:.2f}%")
+        else:
+            # 如果没有对数变换，直接计算
+            # 优先使用传入的参数，其次从criterion读取
+            max_relative_error = self.max_relative_error
+            epsilon = self.epsilon
+            if max_relative_error is None and hasattr(self.criterion, 'max_relative_error'):
+                max_relative_error = self.criterion.max_relative_error
+            if hasattr(self.criterion, 'epsilon'):
+                epsilon = self.criterion.epsilon
+            metrics_original = compute_metrics(
+                all_targets_log.numpy(), 
+                all_preds_log.numpy(), 
+                max_relative_error=max_relative_error, 
+                epsilon=epsilon
+            )
         
         # ===== TensorBoard: 记录验证指标 =====
         if self.writer:
-            self.writer.add_scalar('Loss/val_epoch', criterion_loss, epoch)
-            for metric_name, metric_value in metrics.items():
-                self.writer.add_scalar(f'Metrics/val_{metric_name}', metric_value, epoch)
+            # 对数空间损失
+            self.writer.add_scalar('Loss_Log_Space/val_epoch', criterion_loss_log, epoch)
+            # 原始空间指标
+            for metric_name, metric_value in metrics_original.items():
+                self.writer.add_scalar(f'Metrics_Original/val_{metric_name}', metric_value, epoch)
             
-            # ===== TensorBoard: 可视化预测 vs 真实值（采样部分数据） =====
+            # ===== TensorBoard: 可视化预测 vs 真实值（原始空间） =====
             # 每隔几个epoch记录一次散点图，避免过多I/O
             if epoch % 5 == 0:
                 # 采样前1000个样本进行可视化
-                sample_size = min(1000, len(all_preds))
-                sample_preds = all_preds[:sample_size].numpy().flatten()
-                sample_targets = all_targets[:sample_size].numpy().flatten()
+                sample_size = min(1000, len(all_preds_log))
+                
+                if self.log_transform_enabled:
+                    # 使用原始空间的值绘图
+                    sample_preds = all_preds_original[:sample_size].numpy().flatten()
+                    sample_targets = all_targets_original[:sample_size].numpy().flatten()
+                else:
+                    sample_preds = all_preds_log[:sample_size].numpy().flatten()
+                    sample_targets = all_targets_log[:sample_size].numpy().flatten()
                 
                 # 使用matplotlib创建散点图
                 try:
@@ -489,21 +601,21 @@ class Trainer:
                     max_val = max(sample_targets.max(), sample_preds.max())
                     ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
                     
-                    ax.set_xlabel('True Values')
-                    ax.set_ylabel('Predictions')
+                    ax.set_xlabel('True Values (Original Space)')
+                    ax.set_ylabel('Predictions (Original Space)')
                     ax.set_title(f'Prediction vs True (Epoch {epoch})')
                     ax.legend()
                     ax.grid(True, alpha=0.3)
                     
-                    self.writer.add_figure('Predictions/scatter_plot', fig, epoch)
+                    self.writer.add_figure('Predictions/scatter_plot_original', fig, epoch)
                     plt.close(fig)
                 except ImportError:
                     pass  # matplotlib未安装，跳过可视化
         
-        # 返回所有指标，包含criterion的loss
+        # 返回指标
         return {
-            "loss": criterion_loss,  # 使用配置文件中指定的损失函数
-            **metrics
+            "loss": criterion_loss_log,  # 对数空间的损失（用于early stopping）
+            **metrics_original  # 原始空间的指标（用于展示）
         }
     
     def train(self, num_epochs: int) -> Dict[str, list]:
@@ -522,6 +634,8 @@ class Trainer:
         print(f"模型参数数量: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
         if self.tensorboard_enabled:
             print(f"TensorBoard已启用 (每 {self.tb_log_interval} batch记录标量)")
+        if self.log_transform_enabled:
+            print(f"对数变换已启用 (offset={self.log_offset:.4f})")
         print("-" * 80)
         
         start_time = time.time()
@@ -539,7 +653,7 @@ class Trainer:
             if self.writer:
                 self.writer.add_scalar('Learning_Rate', current_lr, epoch)
             
-            # 更新学习率（使用配置文件中指定的损失函数）
+            # 更新学习率（基于对数空间的损失）
             if self.scheduler is not None:
                 if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step(train_metrics["loss"])
@@ -547,18 +661,18 @@ class Trainer:
                     self.scheduler.step()
             
             # 记录训练指标
-            self.train_history["loss"].append(train_metrics["loss"])  # 使用配置的损失函数
-            self.train_history["metrics"].append(train_metrics)
+            self.train_history["loss"].append(train_metrics["loss"])  # 对数空间的损失
+            self.train_history["metrics"].append(train_metrics)  # 原始空间的指标
             self.train_history["learning_rate"].append(current_lr)
             
             # 验证
             if epoch % self.val_interval == 0:
                 val_metrics = self.validate_epoch(epoch)
-                self.train_history["val_loss"].append(val_metrics["loss"])  # 使用配置的损失函数
-                self.train_history["val_metrics"].append(val_metrics)
+                self.train_history["val_loss"].append(val_metrics["loss"])  # 对数空间的损失
+                self.train_history["val_metrics"].append(val_metrics)  # 原始空间的指标
                 
-                # 检查是否是最佳模型（使用配置的best_metric）
-                current_metric_value = val_metrics.get(self.best_metric, val_metrics["loss"])
+                # 检查是否是最佳模型（使用对数空间的loss）
+                current_metric_value = val_metrics["loss"]  # 始终使用loss进行模型选择
                 is_better = False
                 
                 if self.best_metric_mode == "min":
@@ -576,10 +690,9 @@ class Trainer:
                     if self.save_best and self.save_dir:
                         self.save_checkpoint(epoch, is_best=True)
                 
-                # 早停检查（使用early_stopping配置的指标，如果没配置则使用best_metric）
+                # 早停检查（使用对数空间的loss）
                 if self.early_stopping:
-                    # 早停使用的指标（与best_metric相同）
-                    early_stop_metric = val_metrics.get(self.best_metric, val_metrics["loss"])
+                    early_stop_metric = val_metrics["loss"]
                     if self.early_stopping(early_stop_metric):
                         print(f"\n早停触发于epoch {epoch}")
                         break
@@ -604,7 +717,7 @@ class Trainer:
         
         total_time = time.time() - start_time
         print(f"\n训练完成！总耗时: {total_time/3600:.2f}小时")
-        print(f"最佳验证指标 ({self.best_metric}): {self.best_val_metric:.6f} (epoch {self.best_epoch})")
+        print(f"最佳验证损失（对数空间）: {self.best_val_metric:.6f} (epoch {self.best_epoch})")
         
         # 关闭TensorBoard writer
         if self.writer:
@@ -621,13 +734,17 @@ class Trainer:
         epoch_time: float,
         lr: float
     ):
-        """打印epoch信息，显示所有评估指标"""
+        """打印epoch信息，显示所有评估指标（原始空间）"""
         # 第一行：基本信息
         print(f"{'='*100}")
         print(f"Epoch {epoch:4d} | LR: {lr:.2e} | Time: {epoch_time:.2f}s")
+        if self.log_transform_enabled:
+            print(f"  训练Loss (对数空间): {train_metrics['loss']:.6f}")
+            if val_metrics:
+                print(f"  验证Loss (对数空间): {val_metrics['loss']:.6f}")
         print(f"{'-'*100}")
         
-        # 第二行：训练集指标
+        # 第二行：训练集指标（原始空间）
         print(f"Train  | "
               f"MAE: {train_metrics.get('mae', 0):.6f} | "
               f"MSE: {train_metrics.get('mse', 0):.2f} | "
@@ -635,7 +752,7 @@ class Trainer:
               f"MAPE: {train_metrics.get('mape', 0):.2f}% | "
               f"R²: {train_metrics.get('r2', 0):.6f}")
         
-        # 第三行：验证集指标（如果有）
+        # 第三行：验证集指标（原始空间，如果有）
         if val_metrics:
             print(f"Val    | "
                   f"MAE: {val_metrics.get('mae', 0):.6f} | "
@@ -694,7 +811,10 @@ class Trainer:
             'best_val_metric': self.best_val_metric,
             'best_metric': self.best_metric,
             'best_metric_mode': self.best_metric_mode,
-            'train_history': self.train_history
+            'train_history': self.train_history,
+            # v0.4新增：保存对数变换信息
+            'log_transform_enabled': self.log_transform_enabled,
+            'log_offset': self.log_offset
         }
         
         if self.scheduler is not None:
@@ -732,6 +852,12 @@ class Trainer:
         if 'train_history' in checkpoint:
             self.train_history = checkpoint['train_history']
         
+        # 加载对数变换信息
+        if 'log_transform_enabled' in checkpoint:
+            self.log_transform_enabled = checkpoint['log_transform_enabled']
+        if 'log_offset' in checkpoint:
+            self.log_offset = checkpoint['log_offset']
+        
         # 向后兼容：优先加载新的 best_val_metric，否则尝试 best_val_loss
         if 'best_val_metric' in checkpoint:
             self.best_val_metric = checkpoint['best_val_metric']
@@ -743,3 +869,5 @@ class Trainer:
         best_metric_name = checkpoint.get('best_metric', self.best_metric)
         best_metric_value = checkpoint.get('best_val_metric', checkpoint.get('best_val_loss', 'unknown'))
         print(f"Best Val Metric ({best_metric_name}): {best_metric_value}")
+        if self.log_transform_enabled:
+            print(f"对数变换: enabled (offset={self.log_offset:.4f})")

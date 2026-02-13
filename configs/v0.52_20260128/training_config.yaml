@@ -1,33 +1,33 @@
 # 训练配置文件（集成TensorBoard）
-# 版本: v0.43
-# 日期: 20260119
+# 版本: v0.2
+# 日期: 20251226
 
 metadata:
-  version: "v0.43"
-  date: "20260119"
-  description: "训练配置 (集成TensorBoard可视化，学习型Missing Embedding) - TimeXer双分支模型"
+  version: "v0.2"
+  date: "20251226"
+  description: "训练配置 (集成TensorBoard可视化) - TSMixer深度残差模型"
 
 training:
   # 基础训练参数
-  batch_size: 96          # 在48和128之间取平衡，避免显存OOM
-  num_epochs: 50
-  num_workers: 8          # 启用8个进程并行加载数据，充分利用CPU内存
+  batch_size: 256
+  num_epochs: 15
+  num_workers: 0          # 从8改为4，减少锁竞争
   pin_memory: true
-  prefetch_factor: 6      # 每个worker预取6个batch，增加数据缓存
+  prefetch_factor: 2      # 预取批次数，提升数据加载速度
   persistent_workers: true # 保持worker进程，避免每个epoch重启
   
   # 优化器配置
   optimizer:
     type: "adamw"  # "adam", "adamw", "sgd"
     lr: 1e-4       # 初始学习率
-    weight_decay: 0.05
+    weight_decay: 0.01
     betas: [0.9, 0.999]
   
   # 学习率调度器
   scheduler:
     type: "cosine"  # "cosine", "step", "plateau", "none"
-    T_max: 50       # Cosine退火的最大周期数
-    eta_min: 1e-6  # 最小学习率
+    T_max: 15       # Cosine退火的最大周期数
+    eta_min: 5e-6  # 最小学习率
     step_size: 30   # StepLR的步长
     gamma: 0.1      # StepLR的衰减率
     factor: 0.5     # ReduceLROnPlateau的衰减因子
@@ -35,12 +35,10 @@ training:
   
   # 损失函数
   loss:
-    type: "mse"  # "mse", "mae", "huber", "mape", "smape"（推荐，对接近0的值更鲁棒）
+    type: "mae"  # "mse", "mae", "huber", "mape"
     reduction: "mean"
-    # SMAPE/MAPE特有参数（仅当type="smape"或"mape"时有效）
-    epsilon: 0.01  # 防止除零的小值，增大以平滑小值样本的相对误差
-    max_relative_error: 2.0  # SMAPE裁剪相对误差上限（理论上界为2.0，即200%），避免极端值主导训练
-    # SMAPE优势：对称性好，对接近0的值更鲁棒，不会像MAPE那样在target接近0时损失爆炸
+    # MAPE特有参数（仅当type="mape"时有效）
+    epsilon: 1e-8  # 防止除零的小值
   
   # 验证和保存
   val_interval: 1        # 每N个epoch验证一次
@@ -57,7 +55,7 @@ training:
   
   # 设备配置
   device: "cuda"  # "cuda" 或 "cpu"
-  mixed_precision: false  # 禁用混合精度，避免数值不稳定
+  mixed_precision: false  # 是否使用混合精度训练
 
 # TensorBoard配置
 tensorboard:
@@ -78,13 +76,6 @@ tensorboard:
   # - Gradients/*: 梯度分布（直方图）
   # - Predictions/scatter_plot: 预测值vs真实值散点图（每5个epoch）
 
-# v0.43版本变更（学习型Missing Embedding + 灵活的模型评估指标）：
-# - 模型内部自动检测-1000标记的缺失值
-# - 使用可学习的embedding替换缺失值，无需显式传入mask
-# - 保持向后兼容：数据集可以返回mask，但模型会自动处理
-# - 数值稳定：避免-1000极端值污染网络，在第一个线性层前完成替换
-# - 新增灵活的模型评估机制：
-#   * 训练损失函数（loss.type）用于反向传播和梯度更新
-#   * 最佳模型选择指标（best_metric）独立配置，可选择任意评估指标
-#   * 早停监控指标（early_stopping.metric）独立配置
-#   * 示例：用SMAPE训练，用MAPE选择最佳模型和早停
+
+
+

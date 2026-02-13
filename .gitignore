@@ -12,6 +12,8 @@ experiments/
 
 # 推理结果
 tests/inference_results/
+tests/pre_data/
+tests/predict_and_evaluate/
 
 # Python缓存
 __pycache__/

@@ -2,28 +2,31 @@
 # -*- coding: utf-8 -*-
 """
 按公司分组的模型推理脚本
-版本: v0.3
-日期: 20260119145214
+版本: v0.6
+日期: 20260206121951
 
 功能:
-1. 支持多种模型类型（iTransformer、CrossFormer、TimeXer、TSMixer）
-2. 支持TimeXer新版本：v0.41_20260116、v0.42_20260118、v0.43_20260119
-3. 加载训练好的模型和对应的数据
-4. 对所有训练集和验证集样本进行推理
-5. 按公司分组，每个公司生成独立的Excel和Parquet文件
-6. 计算绝对相对误差和相对误差（有正负值）
-7. 计算每个公司训练集、验证集的统计指标（平均值和标准差）
-8. 生成公司排名文件（按不同误差指标排名）
+1. 支持多种模型类型（iTransformer、CrossFormer、TimeXer、TSMixer、TimeXerMLP、TimeXer-Official）
+2. 支持TimeXer新版本：v0.41_20260116、v0.42_20260118、v0.43_20260119、v0.44_20260126
+3. 支持TimeXer-Official v0.6（官方架构 + Patch-Level内生 + Variate-Level外生）
+4. 加载训练好的模型和对应的数据
+5. 对所有训练集和验证集样本进行推理
+6. 按公司分组，每个公司生成独立的Excel和Parquet文件
+7. 计算绝对相对误差和相对误差（有正负值）
+8. 计算每个公司训练集、验证集的统计指标（平均值和标准差）
+9. 生成公司排名文件（按不同误差指标排名）
+10. 计算收益率：基于输入数据最后一个交易日收盘价和模型预测收盘价
+11. 统计和排名收益率指标
 
-v0.3更新：
-- 添加对TimeXer v0.41（细粒度LayerNorm控制）的支持
-- 添加对TimeXer v0.42（完整mask支持）的支持
-- 添加对TimeXer v0.43（学习型Missing Embedding）的支持
-- 改进版本检测逻辑，从目录名精确识别版本号
+v0.6更新：
+- 添加对TimeXer-Official v0.6模型的支持
+- 支持官方TimeXer架构（Patch-Level内生 + Variate-Level外生 + Global Token）
+- 支持单一内生变量（endogenous_index配置）
+- 支持patch_len=25的分块处理
 
 使用方法:
     修改代码最前面的配置区域，设置MODEL_DIR和PREPROCESSED_DATA_DIR
-    然后运行: python inference_by_company_v0.3_20260119145214.py
+    然后运行: python inference_by_company_v0.6_20260206121951.py
 """
 
 import torch
@@ -45,7 +48,7 @@ sys.path.insert(0, str(project_root))
 
 
 # ===== 模型和数据配置（修改此处） =====
-MODEL_DIR = "/data/project_20251211/experiments/timexer_v0.43_20260127120833_20260119170929_500120"
+MODEL_DIR = "/data/project_20251211/experiments/timexer_v0.6_20260207215300_preprocess_data_v1.0_20260119170929_500120"
 PREPROCESSED_DATA_DIR = "/data/project_20251211/data/processed/preprocess_data_v1.0_20260119170929_500120"
 DEVICE = 'cuda'  # 或 'cpu'
 BATCH_SIZE = 256  # 推理批次大小
@@ -79,6 +82,11 @@ def detect_model_type(model_dir: Path) -> tuple:
     model_name = config.get('model', {}).get('name', '').lower()
     dir_name = model_dir.name.lower()
     
+    # 优先从模型名称识别TimeXer-Official v0.6
+    if 'timexer_official' in model_name or 'timexer_official' in dir_name:
+        # TimeXer-Official v0.6（官方架构）
+        return 'timexer_official', 'v0.6_20260206'
+    
     # 优先从目录名精确识别TimeXer版本
     if 'timexer' in model_name or 'timexer' in dir_name:
         # 尝试从目录名提取精确版本号
@@ -88,7 +96,9 @@ def detect_model_type(model_dir: Path) -> tuple:
         if match:
             version_str = match.group(0)
             # 提取具体版本号（使用前缀匹配，避免日期差异导致的识别失败）
-            if version_str.startswith('v0.43_'):
+            if version_str.startswith('v0.44_'):
+                return 'timexer', 'v0.44_20260126'
+            elif version_str.startswith('v0.43_'):
                 return 'timexer', 'v0.43_20260119'
             elif version_str.startswith('v0.42_'):
                 return 'timexer', 'v0.42_20260118'
@@ -133,7 +143,7 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
         device: 计算设备
         
     Returns:
-        加载好的模型
+        (model, model_version, log_offset): 加载好的模型、模型版本和对数变换offset（如果有）
     """
     print(f"\n加载模型: {model_dir}")
     
@@ -155,8 +165,29 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # 根据模型类型加载对应的模型类
-    models_path = project_root / "src" / "models" / model_version
+    # 读取log_offset（v0.44模型需要）
+    log_offset = checkpoint.get('log_offset', None)
+    if log_offset is not None:
+        print(f"从checkpoint读取log_offset: {log_offset}")
+    
+    # ===== 智能版本检测：根据checkpoint中的参数特征判断实际模型版本 =====
+    checkpoint_keys = set(checkpoint['model_state_dict'].keys())
+    has_missing_embedding = any('missing_embedding' in key for key in checkpoint_keys)
+    
+    # 根据参数特征智能选择模型代码路径
+    if has_missing_embedding and model_type == 'timexer_mlp':
+        # 检测到missing_embedding，使用v0.51版本的模型定义
+        actual_model_version = 'v0.51_20260128'
+        models_path = project_root / "src" / "models" / actual_model_version
+        print(f"检测到missing_embedding参数，使用模型版本: {actual_model_version}")
+    elif model_version == 'v0.44_20260126':
+        # v0.44使用与v0.43相同的模型代码（只是训练方式不同）
+        models_path = project_root / "src" / "models" / "v0.43_20260119"
+    elif model_type == 'timexer_official':
+        # TimeXer-Official使用v0.6版本的模型代码
+        models_path = project_root / "src" / "models" / "v0.6_20260206"
+    else:
+        models_path = project_root / "src" / "models" / model_version
     
     if model_type == 'itransformer':
         itransformer_module = _load_module(models_path / "itransformer_decoder.py", "itransformer_decoder")
@@ -227,6 +258,27 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
             output_projection_config=model_config.get('output_projection', {})
         )
     
+    elif model_type == 'timexer_official':
+        # TimeXer-Official v0.6（官方架构）
+        timexer_official_module = _load_module(models_path / "timexer_official_adapter.py", "timexer_official_adapter")
+        ModelClass = timexer_official_module.TimeXerOfficialAdapter
+        
+        model = ModelClass(
+            seq_len=model_config['seq_len'],
+            n_features=model_config['n_features'],
+            endogenous_index=model_config.get('endogenous_index', 1),
+            prediction_len=model_config.get('prediction_len', 1),
+            patch_len=model_config.get('patch_len', 25),
+            d_model=model_config.get('d_model', 64),
+            n_heads=model_config.get('n_heads', 8),
+            e_layers=model_config.get('e_layers', 2),
+            d_ff=model_config.get('d_ff', 256),
+            dropout=model_config.get('dropout', 0.1),
+            activation=model_config.get('activation', 'gelu'),
+            use_norm=model_config.get('use_norm', True),
+            missing_value_flag=model_config.get('missing_value_flag', -1000.0)
+        )
+    
     elif model_type == 'timexer':
         timexer_module = _load_module(models_path / "timexer.py", "timexer")
         ModelClass = timexer_module.TimeXer
@@ -259,12 +311,14 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
         }
         
         # v0.41 及以上版本特有参数：细粒度LayerNorm控制
-        if model_version in ['v0.41_20260116', 'v0.42_20260118', 'v0.43_20260119']:
+        # v0.44 使用与 v0.43 相同的模型架构（v0.43_20260119）
+        if model_version in ['v0.41_20260116', 'v0.42_20260118', 'v0.43_20260119', 'v0.44_20260126']:
             model_params['use_layernorm_in_tsmixer'] = model_config.get('use_layernorm_in_tsmixer')
             model_params['use_layernorm_in_attention'] = model_config.get('use_layernorm_in_attention')
             model_params['use_layernorm_before_pooling'] = model_config.get('use_layernorm_before_pooling')
         
         # 注意：v0.42的mask支持和v0.43的Missing Embedding都是内部自动处理，不需要外部参数
+        # v0.44的对数变换是在数据预处理阶段完成，模型架构与v0.43相同
         
         model = ModelClass(**model_params)
     
@@ -289,15 +343,35 @@ def load_model_dynamically(model_dir: Path, device: str = 'cuda'):
     else:
         raise ValueError(f"不支持的模型类型: {model_type}")
     
-    # 加载权重
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # ===== 弹性加载权重：允许参数不完全匹配 =====
+    # 使用strict=False允许checkpoint和模型定义之间有差异
+    missing_keys, unexpected_keys = model.load_state_dict(
+        checkpoint['model_state_dict'], 
+        strict=False
+    )
+    
+    # 记录加载详情
+    if missing_keys:
+        print(f"警告: 模型中缺失以下参数（checkpoint中没有）:")
+        for key in missing_keys:
+            print(f"  - {key}")
+    
+    if unexpected_keys:
+        print(f"警告: checkpoint中包含以下额外参数（模型中未使用）:")
+        for key in unexpected_keys:
+            print(f"  - {key}")
+    
+    if not missing_keys and not unexpected_keys:
+        print("✓ 所有参数完全匹配，加载成功")
+    
     model.to(device)
     model.eval()
     
     print(f"模型参数数量: {model.get_num_parameters():,}")
     print(f"模型加载完成，使用设备: {device}")
     
-    return model
+    # 返回模型、版本信息和log_offset
+    return model, model_version, log_offset
 
 
 def load_preprocessed_data(preprocessed_dir: Path):
@@ -383,8 +457,33 @@ def load_index_files(train_data_metadata: dict = None, val_data_metadata: dict =
     return train_index_df, val_index_df
 
 
+def get_close_price_index(feature_names: list) -> int:
+    """
+    从特征名列表中找到收盘价的索引
+    
+    Args:
+        feature_names: 特征名列表
+        
+    Returns:
+        close_price_idx: 收盘价在特征维度中的索引
+    """
+    # 常见的收盘价特征名（注意：'收盘'要放在'收盘价'前面，优先匹配）
+    close_price_patterns = ['收盘', 'close', 'Close', 'CLOSE', '收盘价', 'close_price']
+    
+    for pattern in close_price_patterns:
+        for idx, name in enumerate(feature_names):
+            if pattern in name:
+                print(f"找到收盘价特征: {name} (索引: {idx})")
+                return idx
+    
+    # 如果没找到，抛出异常
+    raise ValueError(f"无法在特征列表中找到收盘价特征。特征列表: {feature_names}")
+
+
 def inference_all_samples(
     model: nn.Module,
+    model_version: str,
+    log_offset: float = None,
     train_data: dict = None,
     val_data: dict = None,
     train_index_df: pd.DataFrame = None,
@@ -398,6 +497,8 @@ def inference_all_samples(
     
     Args:
         model: 模型
+        model_version: 模型版本（用于判断是否需要对数还原）
+        log_offset: 对数变换的offset（v0.44模型需要）
         train_data: 训练集数据，如果为None则跳过训练集推理
         val_data: 验证集数据，如果为None则跳过验证集推理
         train_index_df: 训练集索引DataFrame，如果为None则跳过训练集推理
@@ -411,6 +512,28 @@ def inference_all_samples(
     print("\n" + "=" * 80)
     print("开始推理")
     print("=" * 80)
+    
+    # 判断是否需要对数还原（v0.44模型使用对数空间训练）
+    needs_log_inverse = (model_version == 'v0.44_20260126')
+    if needs_log_inverse:
+        if log_offset is None:
+            raise ValueError("v0.44模型需要log_offset进行还原，但未找到log_offset信息！")
+        print(f"\n*** 检测到v0.44模型，将使用 exp(pred) - {log_offset:.4f} 进行对数还原 ***")
+        print(f"*** 真实值已经是原始收盘价，不需要还原 ***")
+    
+    # 获取收盘价特征索引
+    close_price_idx = None
+    if train_data is not None:
+        feature_names = train_data['metadata'].get('feature_columns_example', [])
+        if feature_names:
+            close_price_idx = get_close_price_index(feature_names)
+    elif val_data is not None:
+        feature_names = val_data['metadata'].get('feature_columns_example', [])
+        if feature_names:
+            close_price_idx = get_close_price_index(feature_names)
+    
+    if close_price_idx is None:
+        raise ValueError("无法获取收盘价特征索引！")
     
     # 存储结果
     results = []
@@ -428,6 +551,7 @@ def inference_all_samples(
         # 推理训练集
         print("\n推理训练集...")
         train_predictions = []
+        train_last_close_prices = []
         train_indices = []
         
         with torch.no_grad():
@@ -435,21 +559,35 @@ def inference_all_samples(
             for i in tqdm(range(0, len(train_X), batch_size), desc="训练集推理"):
                 batch_X = train_X[i:i+batch_size].to(device)
                 batch_pred = model(batch_X)
+                
+                # v0.44模型需要从对数空间还原：exp(pred) - log_offset
+                if needs_log_inverse:
+                    batch_pred = torch.exp(batch_pred) - log_offset
+                
+                # 提取输入数据最后一个时间步的收盘价
+                batch_last_close = batch_X[:, -1, close_price_idx].cpu().numpy().flatten().tolist()
+                
                 train_predictions.extend(batch_pred.cpu().numpy().flatten().tolist())
+                train_last_close_prices.extend(batch_last_close)
                 train_indices.extend(range(i, min(i+batch_size, len(train_X))))
         
         # 合并训练集结果
         print("\n合并训练集结果...")
-        for idx, pred_value in zip(train_indices, train_predictions):
+        for idx, pred_value, last_close_price in zip(train_indices, train_predictions, train_last_close_prices):
             if idx < len(train_index_df):
                 sample_info = train_index_df.iloc[idx]
                 true_value = train_y[idx].item()
+                
+                # 注意：train_y中的值已经是原始空间的收盘价，不需要还原
                 
                 # 计算绝对相对误差
                 abs_relative_error = abs(pred_value - true_value) / abs(true_value) * 100 if true_value != 0 else float('inf')
                 
                 # 计算相对误差（有正负值）
                 relative_error_signed = (pred_value - true_value) / true_value * 100 if true_value != 0 else float('inf')
+                
+                # 计算收益率：(预测收盘价 - 输入最后收盘价) / 输入最后收盘价 * 100
+                return_rate = (pred_value - last_close_price) / last_close_price * 100 if last_close_price != 0 else float('inf')
                 
                 # 处理日期字段（可能是datetime对象）
                 target_date = sample_info.get('target_date', '')
@@ -465,10 +603,12 @@ def inference_all_samples(
                     'company_name': sample_info.get('company_name', ''),
                     'stock_code': sample_info.get('stock_code', ''),
                     'target_date': target_date,
+                    'last_input_close': last_close_price,
                     'pred_value': pred_value,
                     'true_value': true_value,
                     'abs_relative_error': abs_relative_error,
-                    'relative_error_signed': relative_error_signed
+                    'relative_error_signed': relative_error_signed,
+                    'return_rate': return_rate
                 })
     else:
         print("\n跳过训练集推理（数据或索引不存在）")
@@ -484,27 +624,42 @@ def inference_all_samples(
         # 推理验证集
         print("\n推理验证集...")
         val_predictions = []
+        val_last_close_prices = []
         val_indices = []
         
         with torch.no_grad():
             for i in tqdm(range(0, len(val_X), batch_size), desc="验证集推理"):
                 batch_X = val_X[i:i+batch_size].to(device)
                 batch_pred = model(batch_X)
+                
+                # v0.44模型需要从对数空间还原：exp(pred) - log_offset
+                if needs_log_inverse:
+                    batch_pred = torch.exp(batch_pred) - log_offset
+                
+                # 提取输入数据最后一个时间步的收盘价
+                batch_last_close = batch_X[:, -1, close_price_idx].cpu().numpy().flatten().tolist()
+                
                 val_predictions.extend(batch_pred.cpu().numpy().flatten().tolist())
+                val_last_close_prices.extend(batch_last_close)
                 val_indices.extend(range(i, min(i+batch_size, len(val_X))))
         
         # 合并验证集结果
         print("\n合并验证集结果...")
-        for idx, pred_value in zip(val_indices, val_predictions):
+        for idx, pred_value, last_close_price in zip(val_indices, val_predictions, val_last_close_prices):
             if idx < len(val_index_df):
                 sample_info = val_index_df.iloc[idx]
                 true_value = val_y[idx].item()
+                
+                # 注意：val_y中的值已经是原始空间的收盘价，不需要还原
                 
                 # 计算绝对相对误差
                 abs_relative_error = abs(pred_value - true_value) / abs(true_value) * 100 if true_value != 0 else float('inf')
                 
                 # 计算相对误差（有正负值）
                 relative_error_signed = (pred_value - true_value) / true_value * 100 if true_value != 0 else float('inf')
+                
+                # 计算收益率：(预测收盘价 - 输入最后收盘价) / 输入最后收盘价 * 100
+                return_rate = (pred_value - last_close_price) / last_close_price * 100 if last_close_price != 0 else float('inf')
                 
                 # 处理日期字段（可能是datetime对象）
                 target_date = sample_info.get('target_date', '')
@@ -520,10 +675,12 @@ def inference_all_samples(
                     'company_name': sample_info.get('company_name', ''),
                     'stock_code': sample_info.get('stock_code', ''),
                     'target_date': target_date,
+                    'last_input_close': last_close_price,
                     'pred_value': pred_value,
                     'true_value': true_value,
                     'abs_relative_error': abs_relative_error,
-                    'relative_error_signed': relative_error_signed
+                    'relative_error_signed': relative_error_signed,
+                    'return_rate': return_rate
                 })
     else:
         print("\n跳过验证集推理（数据或索引不存在）")
@@ -583,14 +740,18 @@ def group_by_company_and_save(results: list, output_dir: Path):
             if i < len(train_df):
                 train_row = train_df.iloc[i]
                 row['训练_数据时间'] = train_row['target_date']
+                row['训练_输入最后收盘价'] = train_row['last_input_close']
                 row['训练_预测收盘价'] = train_row['pred_value']
                 row['训练_真实收盘价'] = train_row['true_value']
+                row['训练_收益率%'] = train_row['return_rate']
                 row['训练_绝对相对误差'] = train_row['abs_relative_error']
                 row['训练_相对误差'] = train_row['relative_error_signed']
             else:
                 row['训练_数据时间'] = None
+                row['训练_输入最后收盘价'] = None
                 row['训练_预测收盘价'] = None
                 row['训练_真实收盘价'] = None
+                row['训练_收益率%'] = None
                 row['训练_绝对相对误差'] = None
                 row['训练_相对误差'] = None
             
@@ -598,14 +759,18 @@ def group_by_company_and_save(results: list, output_dir: Path):
             if i < len(val_df):
                 val_row = val_df.iloc[i]
                 row['验证_数据时间'] = val_row['target_date']
+                row['验证_输入最后收盘价'] = val_row['last_input_close']
                 row['验证_预测收盘价'] = val_row['pred_value']
                 row['验证_真实收盘价'] = val_row['true_value']
+                row['验证_收益率%'] = val_row['return_rate']
                 row['验证_绝对相对误差'] = val_row['abs_relative_error']
                 row['验证_相对误差'] = val_row['relative_error_signed']
             else:
                 row['验证_数据时间'] = None
+                row['验证_输入最后收盘价'] = None
                 row['验证_预测收盘价'] = None
                 row['验证_真实收盘价'] = None
+                row['验证_收益率%'] = None
                 row['验证_绝对相对误差'] = None
                 row['验证_相对误差'] = None
             
@@ -626,9 +791,11 @@ def group_by_company_and_save(results: list, output_dir: Path):
             # 过滤掉inf和NaN值
             train_abs_rel_errors = train_df['abs_relative_error'].replace([float('inf'), -float('inf')], np.nan)
             train_rel_errors = train_df['relative_error_signed'].replace([float('inf'), -float('inf')], np.nan)
+            train_return_rates = train_df['return_rate'].replace([float('inf'), -float('inf')], np.nan)
             
             train_abs_rel_errors_clean = train_abs_rel_errors.dropna()
             train_rel_errors_clean = train_rel_errors.dropna()
+            train_return_rates_clean = train_return_rates.dropna()
             
             if len(train_abs_rel_errors_clean) > 0:
                 stats_row['训练_绝对相对误差_平均值'] = train_abs_rel_errors_clean.mean()
@@ -643,20 +810,28 @@ def group_by_company_and_save(results: list, output_dir: Path):
             else:
                 stats_row['训练_相对误差_平均值'] = np.nan
                 stats_row['训练_相对误差_标准差'] = np.nan
+            
+            if len(train_return_rates_clean) > 0:
+                stats_row['训练_收益率_平均值'] = train_return_rates_clean.mean()
+            else:
+                stats_row['训练_收益率_平均值'] = np.nan
         else:
             stats_row['训练_绝对相对误差_平均值'] = np.nan
             stats_row['训练_绝对相对误差_标准差'] = np.nan
             stats_row['训练_相对误差_平均值'] = np.nan
             stats_row['训练_相对误差_标准差'] = np.nan
+            stats_row['训练_收益率_平均值'] = np.nan
         
         # 验证集统计
         if len(val_df) > 0:
             # 过滤掉inf和NaN值
             val_abs_rel_errors = val_df['abs_relative_error'].replace([float('inf'), -float('inf')], np.nan)
             val_rel_errors = val_df['relative_error_signed'].replace([float('inf'), -float('inf')], np.nan)
+            val_return_rates = val_df['return_rate'].replace([float('inf'), -float('inf')], np.nan)
             
             val_abs_rel_errors_clean = val_abs_rel_errors.dropna()
             val_rel_errors_clean = val_rel_errors.dropna()
+            val_return_rates_clean = val_return_rates.dropna()
             
             if len(val_abs_rel_errors_clean) > 0:
                 stats_row['验证_绝对相对误差_平均值'] = val_abs_rel_errors_clean.mean()
@@ -671,11 +846,17 @@ def group_by_company_and_save(results: list, output_dir: Path):
             else:
                 stats_row['验证_相对误差_平均值'] = np.nan
                 stats_row['验证_相对误差_标准差'] = np.nan
+            
+            if len(val_return_rates_clean) > 0:
+                stats_row['验证_收益率_平均值'] = val_return_rates_clean.mean()
+            else:
+                stats_row['验证_收益率_平均值'] = np.nan
         else:
             stats_row['验证_绝对相对误差_平均值'] = np.nan
             stats_row['验证_绝对相对误差_标准差'] = np.nan
             stats_row['验证_相对误差_平均值'] = np.nan
             stats_row['验证_相对误差_标准差'] = np.nan
+            stats_row['验证_收益率_平均值'] = np.nan
         
         all_stats.append(stats_row)
         
@@ -805,6 +986,17 @@ def generate_ranking_files(all_stats: list, output_dir: Path):
             'std_col': '验证_相对误差_标准差',
             'sheet_name': '验证集_相对误差绝对值+2标准差',
             'calc_func': lambda row: abs(row['验证_相对误差_平均值']) + 2 * row['验证_相对误差_标准差'] if pd.notna(row['验证_相对误差_平均值']) and pd.notna(row['验证_相对误差_标准差']) else np.nan
+        },
+        # 新增：收益率排名
+        {
+            'name': '训练集_平均收益率',
+            'value_col': '训练_收益率_平均值',
+            'sheet_name': '训练集_平均收益率'
+        },
+        {
+            'name': '验证集_平均收益率',
+            'value_col': '验证_收益率_平均值',
+            'sheet_name': '验证集_平均收益率'
         }
     ]
     
@@ -901,7 +1093,7 @@ def main():
     output_dir = output_base_dir / output_dir_name
     
     print("=" * 80)
-    print("按公司分组的模型推理脚本 v0.3")
+    print("按公司分组的模型推理脚本 v0.6")
     print("=" * 80)
     print(f"模型目录: {model_dir}")
     print(f"预处理数据目录: {preprocessed_dir}")
@@ -909,8 +1101,8 @@ def main():
     print(f"计算设备: {device}")
     print("=" * 80)
     
-    # 加载模型
-    model = load_model_dynamically(model_dir, device=device)
+    # 加载模型（返回模型、版本信息和log_offset）
+    model, model_version, log_offset = load_model_dynamically(model_dir, device=device)
     
     # 加载预处理数据
     train_data, val_data = load_preprocessed_data(preprocessed_dir)
@@ -921,9 +1113,11 @@ def main():
         val_data['metadata'] if val_data is not None else None
     )
     
-    # 推理所有样本
+    # 推理所有样本（传递模型版本信息和log_offset）
     results = inference_all_samples(
         model=model,
+        model_version=model_version,
+        log_offset=log_offset,
         train_data=train_data,
         val_data=val_data,
         train_index_df=train_index_df,
